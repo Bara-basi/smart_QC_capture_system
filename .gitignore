@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Vue
+node_modules/
+dist/
+
+# Local configuration and uploads
+.env
+.env.*
+!.env.example
+data/
+
+# Editors and operating systems
+.vscode/
+.idea/
+Thumbs.db

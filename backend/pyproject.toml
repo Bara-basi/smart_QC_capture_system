@@ -1,0 +1,25 @@
+[project]
+name = "qc-photo-system-api"
+version = "0.1.0"
+description = "Quality-control photo task system API"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "itsdangerous",
+    "uvicorn[standard]",
+    "pydantic-settings",
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "alembic",
+    "lark-oapi",
+    "oss2",
+    "httpx",
+    "apscheduler",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "ruff"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
