@@ -2,6 +2,7 @@
 -- Demo data may be discarded; rerun this file only on an empty database.
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
 DO $$ BEGIN
     CREATE TYPE user_character AS ENUM ('inspector', 'salesperson', 'admin');
@@ -52,47 +53,60 @@ CREATE TABLE order_items (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Maps the Feishu inspection-task fields to English column names.
+-- The only additions are the Bitable record ID, audit timestamps, and IDs
+-- expanded from the 质检员 person field.
 CREATE TABLE inspection_photo_tasks (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    order_item_id UUID NOT NULL REFERENCES order_items(id) ON DELETE CASCADE,
-    contract_no VARCHAR(100) NOT NULL,
-    inspection_item VARCHAR(100) NOT NULL,
-    required BOOLEAN NOT NULL DEFAULT TRUE,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    inspection_status VARCHAR(100),
+    feishu_record_id VARCHAR(128) PRIMARY KEY,
+    contract_no TEXT NOT NULL,
+    sequence_no TEXT,
+    task_id TEXT,
+    product_type TEXT,
+    specification TEXT,
+    quantity TEXT,
+    inspection_stage TEXT,
+    inspector_name TEXT,
+    inspection_status TEXT,
     inspector_open_id VARCHAR(128),
     inspector_union_id VARCHAR(128),
-    inspector_name VARCHAR(100),
-    feishu_record_id VARCHAR(128) NOT NULL UNIQUE,
-    feishu_fields JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE photo_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    task_id UUID REFERENCES inspection_photo_tasks(id) ON DELETE SET NULL,
+    task_feishu_record_id VARCHAR(128) REFERENCES inspection_photo_tasks(feishu_record_id) ON DELETE SET NULL,
     photographer_open_id VARCHAR(128) REFERENCES users(open_id),
     captured_at TIMESTAMPTZ NOT NULL,
     uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     contract_no VARCHAR(100) NOT NULL,
     product_type VARCHAR(100) NOT NULL,
     inspection_item VARCHAR(100) NOT NULL,
+    source VARCHAR(50) NOT NULL DEFAULT 'feishu_h5_camera',
+    factory_initials VARCHAR(32),
+    sequence_no TEXT,
+    specification TEXT,
+    photographer_name VARCHAR(100),
     oss_object_key TEXT NOT NULL UNIQUE,
+    preview_oss_object_key TEXT NOT NULL UNIQUE,
     original_filename TEXT,
     content_type VARCHAR(100) NOT NULL DEFAULT 'image/jpeg',
     file_size_bytes BIGINT NOT NULL CHECK (file_size_bytes > 0),
     sha256 CHAR(64) NOT NULL,
     status photo_status NOT NULL DEFAULT 'uploaded',
     metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    search_text TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX ix_order_items_contract_product ON order_items (contract_no, product_type);
 CREATE INDEX ix_order_items_inspector_status ON order_items (inspector_union_id, inspection_status);
-CREATE INDEX ix_photo_tasks_contract_item ON inspection_photo_tasks (contract_no, inspection_item);
+CREATE INDEX ix_photo_tasks_contract_product ON inspection_photo_tasks (contract_no, product_type);
 CREATE INDEX ix_photo_tasks_inspector_status ON inspection_photo_tasks (inspector_union_id, inspection_status);
 CREATE INDEX ix_photo_records_contract ON photo_records (contract_no, captured_at DESC);
+CREATE INDEX ix_photo_records_lookup ON photo_records (factory_initials, product_type, inspection_item, captured_at DESC);
+CREATE INDEX ix_photo_records_search ON photo_records USING GIN (to_tsvector('simple', search_text));
+CREATE INDEX ix_photo_records_search_trgm ON photo_records USING GIN (search_text gin_trgm_ops);
 
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;

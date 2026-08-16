@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any
@@ -10,7 +11,9 @@ from typing import Any
 import asyncpg
 
 from app.core.config import settings
-from app.integrations.feishu_bitable import FeishuBitableClient
+from app.integrations.feishu_bitable import FeishuBitableClient, FeishuBitableError
+
+logger = logging.getLogger(__name__)
 
 
 class SyncValidationError(ValueError):
@@ -60,6 +63,18 @@ def _person_reference(value: Any) -> tuple[str | None, str | None]:
     return None, _text(value)
 
 
+async def _union_id_or_none(client: FeishuBitableClient, open_id: str | None) -> str | None:
+    if not open_id:
+        return None
+    try:
+        return await client.get_person_union_id(open_id)
+    except FeishuBitableError as exc:
+        # A missing Contact scope must not prevent a photo task from reaching
+        # the inspector. The raw person name and open_id remain available.
+        logger.warning("Could not resolve Feishu union_id for %s: %s", open_id, exc)
+        return None
+
+
 def _contract_no(fields: dict[str, Any]) -> str | None:
     return _text(_find(fields, "合同号", "合同编号", "contract_no", "contract number"))
 
@@ -77,7 +92,7 @@ async def _upsert_order_item(connection: asyncpg.Connection, client: FeishuBitab
         raise SyncValidationError("Order record needs record_id, 合同号 and 产品类型")
 
     inspector_open_id, inspector_name = _person_reference(_find(fields, "质检员", "检验员", "inspector"))
-    inspector_union_id = await client.get_person_union_id(inspector_open_id) if inspector_open_id else None
+    inspector_union_id = await _union_id_or_none(client, inspector_open_id)
     inspection_status = _text(_find(fields, "质检状态", "检验状态", "inspection_status", "inspection status"))
     year_code = datetime.now(UTC).strftime("%y")
     await connection.execute(
@@ -113,31 +128,24 @@ async def _upsert_tasks(connection: asyncpg.Connection, contract_no: str) -> int
         record_id = record.get("record_id")
         if not record_id:
             continue
-        product_type = _product_type(fields)
-        rows = await connection.fetch(
-            "SELECT id FROM order_items WHERE contract_no = $1 AND ($2::varchar IS NULL OR product_type = $2)",
-            contract_no, product_type,
-        )
-        if not rows:
-            raise SyncValidationError(f"Task {record_id} has no matching order item for contract {contract_no}")
-        if len(rows) > 1:
-            raise SyncValidationError(f"Task {record_id} needs 产品类型 because contract {contract_no} has multiple products")
-        inspection_item = _text(_find(fields, "质检项目", "拍照项目", "任务名称", "任务id", "task_id", "质检阶段", "inspection_item", "inspection item")) or record_id
         inspector_open_id, inspector_name = _person_reference(_find(fields, "质检员", "检验员", "inspector"))
-        inspector_union_id = await client.get_person_union_id(inspector_open_id) if inspector_open_id else None
-        inspection_status = _text(_find(fields, "质检状态", "任务状态", "inspection_status", "inspection status"))
+        inspector_union_id = await _union_id_or_none(client, inspector_open_id)
         await connection.execute(
             """INSERT INTO inspection_photo_tasks
-               (order_item_id, inspection_item, feishu_record_id, feishu_fields, contract_no,
-                inspection_status, inspector_open_id, inspector_union_id, inspector_name)
-               VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9)
+               (feishu_record_id, contract_no, sequence_no, task_id, product_type, specification, quantity, inspection_stage,
+                inspector_name, inspection_status, inspector_open_id, inspector_union_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                ON CONFLICT (feishu_record_id) DO UPDATE SET
-                 order_item_id = EXCLUDED.order_item_id, inspection_item = EXCLUDED.inspection_item,
-                 feishu_fields = EXCLUDED.feishu_fields, contract_no = EXCLUDED.contract_no,
-                 inspection_status = EXCLUDED.inspection_status, inspector_open_id = EXCLUDED.inspector_open_id, inspector_union_id = EXCLUDED.inspector_union_id,
-                 inspector_name = EXCLUDED.inspector_name, updated_at = NOW()""",
-            rows[0]["id"], inspection_item, record_id, json.dumps(fields, ensure_ascii=False), contract_no,
-            inspection_status, inspector_open_id, inspector_union_id, inspector_name,
+                 contract_no = EXCLUDED.contract_no, sequence_no = EXCLUDED.sequence_no, task_id = EXCLUDED.task_id,
+                 product_type = EXCLUDED.product_type, specification = EXCLUDED.specification, quantity = EXCLUDED.quantity,
+                 inspection_stage = EXCLUDED.inspection_stage, inspector_name = EXCLUDED.inspector_name,
+                 inspection_status = EXCLUDED.inspection_status, inspector_open_id = EXCLUDED.inspector_open_id,
+                 inspector_union_id = EXCLUDED.inspector_union_id, updated_at = NOW()""",
+            record_id,
+            _text(fields.get("合同号")), _text(fields.get("序号")), _text(fields.get("任务ID")),
+            _text(fields.get("产品类型")), _text(fields.get("规格")), _text(fields.get("数量")),
+            _text(fields.get("质检阶段")), inspector_name, _text(fields.get("质检状态")),
+            inspector_open_id, inspector_union_id,
         )
         count += 1
     return count

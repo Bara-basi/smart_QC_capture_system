@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     feishu_sync_webhook_secret: str = ""
     oss_endpoint: str = ""
     oss_bucket: str = ""
+    oss_preview_bucket: str = "smart-qc-capture-system-preview-images"
     oss_access_key_id: str = ""
     oss_access_key_secret: str = ""
     oss_prefix: str = "orders"
