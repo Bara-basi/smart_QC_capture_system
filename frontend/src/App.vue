@@ -71,10 +71,9 @@ let jsapiReady: Promise<void> | null = null
 const surname = computed(() => dashboard.value?.user.name?.slice(0, 1) || '质')
 const greeting = computed(() => {
   const hour = new Date().getHours()
-  if (hour < 5) return '夜深了，注意休息'
+  if (hour < 5) return `夜深了，${surname.value}工，注意休息`
   const time = hour < 12 ? '上午好' : hour < 18 ? '下午好' : '晚上好'
-  const name = dashboard.value?.user.name || '质检员'
-  return `${time}，${name}工`
+  return `${time}，${surname.value}工`
 })
 const todayText = computed(() => `今天有 ${dashboard.value?.pending_task_count || 0} 个拍照任务`)
 const photoKey = (taskId: string, requirement: string) => `${taskId}:${requirement}`
@@ -299,6 +298,7 @@ function onPhotoWheel(event: WheelEvent) {
 }
 
 function startPhotoGesture(event: PointerEvent) {
+  if (activePhotoPointers.size >= 2) return
   const stage = event.currentTarget as HTMLElement
   stage.setPointerCapture(event.pointerId)
   activePhotoPointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
@@ -359,6 +359,11 @@ async function openTask(recordId: string) {
   page.value = 'capture'
 }
 
+function openFirstTask() {
+  const taskId = dashboard.value?.orders[0]?.task_ids[0]
+  if (taskId) openTask(taskId)
+}
+
 async function configureFeishuJsapi() {
   if (jsapiReady) return jsapiReady
   if (!window.h5sdk || !window.tt) throw new Error('请在飞书手机客户端内打开后使用拍照功能')
@@ -382,7 +387,7 @@ async function addPhoto(taskId: string, requirement: string) {
     await configureFeishuJsapi()
     const result = await new Promise<FeishuChooseImageResult>((resolve, reject) => window.tt!.chooseImage({ count: 1, sourceType: ['camera'], sizeType: ['compressed'], success: resolve, fail: reject }))
     const localPath = result.tempFilePaths?.[0] || result.localIds?.[0]
-    if (!localPath) throw new Error('飞书没有返回拍摄的照片')
+    if (!localPath) return
     const task = activeTask.value?.tasks.find(item => item.feishu_record_id === taskId)
     if (!task || !activeTask.value) throw new Error('拍照任务已失效，请返回后重新进入')
     const image = await readTemporaryPhoto(localPath)
@@ -393,9 +398,23 @@ async function addPhoto(taskId: string, requirement: string) {
     const list = photos.value[photoKey(taskId, requirement)] ||= []
     list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, requirement), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: imageUrl, draftId: draft.id })
   } catch (cause) {
-    const message = cause instanceof Error ? cause.message : String(cause)
-    cameraError.value = /cancel/i.test(message) ? '' : `无法打开相机：${message}`
+    cameraError.value = cameraFailureMessage(cause)
   }
+}
+
+function cameraFailureMessage(cause: unknown) {
+  let detail = ''
+  if (cause instanceof Error) {
+    detail = cause.message
+  } else if (cause && typeof cause === 'object') {
+    const value = cause as Record<string, unknown>
+    detail = [value.errMsg, value.message, value.errorMessage].find(item => typeof item === 'string') as string || ''
+  } else if (typeof cause === 'string') {
+    detail = cause
+  }
+  if (!detail || /cancel|cancelled|canceled|abort|取消/i.test(detail)) return ''
+  if (/请在飞书|升级飞书|相机权限/.test(detail)) return detail
+  return '暂时无法使用相机，请检查飞书相机权限后重试'
 }
 
 function buildPhotoName(contractNo: string, specification: string, productType: string, requirement: string) {
@@ -545,14 +564,14 @@ onMounted(async () => {
         <section v-if="page === 'home'" class="screen home-screen">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>质检拍照</strong><span class="header-space"/></header>
           <div class="greeting"><div class="avatar">{{ surname }}</div><div><p class="eyebrow">{{ greeting }}</p><h1>{{ todayText }}</h1><p class="muted">每一张照片，都让交付更有凭据。</p></div></div>
-          <div class="todo-card"><div class="card-heading"><span>我的待办</span><button @click="dashboard?.orders[0] && openTask(dashboard.orders[0].task_ids[0])">查看全部 ›</button></div><div class="todo-row"><div class="todo-icon">✓</div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
+          <div class="todo-card" :class="{ interactive: dashboard?.orders.length }" role="button" :aria-disabled="!dashboard?.orders.length" :tabindex="dashboard?.orders.length ? 0 : -1" @click="openFirstTask" @keydown.enter="openFirstTask" @keydown.space.prevent="openFirstTask"><div class="card-heading"><span>我的待办</span></div><div class="todo-row"><div class="todo-icon">✓</div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
           <div class="list-title"><div><p class="eyebrow">合同任务</p><h2>待处理订单</h2></div></div>
           <p v-if="!dashboard?.orders.length" class="empty">暂无分配给你的待处理任务</p>
           <article v-for="order in dashboard?.orders" :key="order.contract_no" class="contract-card" :class="{ completed: order.status === 'completed' }" @click="openTask(order.task_ids[0])"><div class="contract-top"><span class="status" :class="{ done: order.status === 'completed' }">{{ order.status === 'completed' ? '已完成' : '待拍摄' }}</span><span class="due">{{ formatDate(order.started_at) }}</span></div><h3>{{ order.contract_no }}</h3><div class="tag-row"><span v-for="product in order.products" :key="product">{{ product }}</span></div><div class="progress"><i :style="{ width: `${order.task_count ? (order.task_count - order.pending_count) / order.task_count * 100 : 0}%` }"/></div><footer><span>{{ order.status === 'completed' ? `已完成 ${order.task_count} / ${order.task_count} 项任务` : `剩余 ${order.pending_count} / ${order.task_count} 项任务` }}</span><b>{{ order.status === 'completed' ? '查看详情 ›' : '进入拍摄 ›' }}</b></footer></article>
         </section>
 
         <section v-else-if="page === 'capture' && activeTask" class="screen capture-screen">
-          <header class="topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
+          <header class="topbar capture-topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
           <div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.specification || task.product_type || `任务 ${index + 1}` }}</span></button></div>
@@ -605,7 +624,7 @@ onMounted(async () => {
         </section>
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
           <header><button aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}</small></div><a :href="galleryPhotoUrl(selectedGalleryPhoto, 'download')" target="_blank" rel="noopener">下载</a></header>
-          <div class="photo-stage" :class="{ dragging: photoDragging }" @wheel.prevent="onPhotoWheel" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
+          <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
             <img class="viewer-preview" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
             <span v-else-if="photoScale === 1" class="gesture-hint">双指捏合缩放 · 放大后单指拖动</span>
@@ -627,4 +646,5 @@ onMounted(async () => {
 .gallery-filters{display:flex;gap:7px;margin:15px 0 10px;overflow-x:auto;padding-bottom:2px}.filter-select{flex:none;display:flex;align-items:center;gap:4px;padding:0 8px;height:32px;border:1px solid #dfe5ec;border-radius:8px;background:#fff;color:#596573;font-size:11px}.filter-select span{color:#8a94a1}.filter-select select{max-width:92px;border:0;background:transparent;color:#334155;font:inherit;outline:0}.date-chip.selected{border-color:#8eb1ff;color:#2863db}.date-filter{display:flex;align-items:end;gap:8px;padding:10px;margin-bottom:9px;border-radius:9px;background:#fff;border:1px solid #e5eaf0}.date-filter label{display:flex;flex-direction:column;gap:4px;font-size:10px;color:#7d8794}.date-filter input{width:118px;border:1px solid #dfe5ec;border-radius:5px;padding:4px;font:inherit;font-size:11px}.date-filter button{font-size:11px;color:#3370ff;padding:5px}.gallery-actions{display:flex;align-items:center;gap:5px}.gallery-actions button{height:25px;min-width:25px;border:1px solid #e0e5eb;border-radius:5px;color:#7b8592;font-size:13px}.gallery-actions .sort-button{padding:0 7px;font-size:11px}.gallery-actions button.active{background:#edf3ff;border-color:#9bbcfb;color:#3370ff}.gallery.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.gallery.grid .gallery-item{display:block;padding:6px}.gallery.grid .thumb{width:100%;height:120px;display:block}.gallery.grid .file-info{padding:7px 2px 2px}.gallery.grid .file-info b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.thumb{object-fit:cover;background:#dde4e9}.gallery-item .thumb{flex:none}
 .gallery-screen{overflow-x:hidden}.gallery-tabs{margin-top:8px}.gallery-tabs button{font-size:14px}.gallery-search{height:42px;margin:14px 0 10px;display:flex;align-items:center;gap:8px;padding:0 12px;border:1px solid #e1e6ed;border-radius:10px;background:#fff;box-shadow:0 2px 8px #17233c08;color:#87909c}.gallery-search:focus-within{border-color:#8fb2ff;box-shadow:0 0 0 3px #3370ff14}.gallery-search>span{font-size:22px;line-height:1;transform:rotate(-20deg)}.gallery-search input{min-width:0;flex:1;border:0;outline:0;background:transparent;color:#1f2329;font:inherit;font-size:13px}.gallery-search input::placeholder{color:#a3aab4}.gallery-search button{width:24px;height:24px;border-radius:50%;background:#eef1f5;color:#76808d;font-size:18px;line-height:20px}.gallery-filter-shell{position:relative}.gallery-filters{margin:0 0 10px;padding:0 0 2px;overflow-x:auto}.filter-select{height:34px;padding:0 10px;gap:5px;font-size:12px;transition:.15s}.filter-select>span{color:#8a94a1}.filter-select>i{width:6px;height:6px;margin:-3px 1px 0 2px;border-right:1.5px solid currentColor;border-bottom:1.5px solid currentColor;transform:rotate(45deg);transition:.15s}.filter-select.open>i{margin-top:3px;transform:rotate(225deg)}.filter-select.selected,.filter-select.open{border-color:#8eb1ff;background:#f4f7ff;color:#2863db}.filter-panel{position:relative;z-index:9;margin:-3px 0 11px;padding:10px;border:1px solid #e2e7ee;border-radius:11px;background:#fff;box-shadow:0 10px 28px #17233c1a;animation:filter-in .14s ease-out}@keyframes filter-in{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}.option-panel{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.option-panel button{min-height:34px;padding:6px;border-radius:7px;background:#f6f7f9;color:#4c5663;font-size:12px}.option-panel button.selected{background:#eaf1ff;color:#2863db;font-weight:600}.calendar-panel{padding:12px}.date-presets{display:flex;gap:7px;margin-bottom:10px}.date-presets button{padding:6px 11px;border-radius:7px;background:#f2f5f9;color:#53606e;font-size:12px}.calendar-head{display:grid;grid-template-columns:34px 1fr 34px;align-items:center;margin-bottom:7px}.calendar-head b{text-align:center;font-size:14px}.calendar-head button{height:30px;border-radius:7px;color:#596574;font-size:24px}.calendar-head button:active{background:#eef3fc}.calendar-week,.calendar-grid{display:grid;grid-template-columns:repeat(7,1fr);text-align:center}.calendar-week{margin-bottom:3px;color:#9aa2ad;font-size:10px}.calendar-grid{row-gap:3px}.calendar-grid button{position:relative;height:34px;border-radius:8px;font-size:12px;z-index:1}.calendar-grid button.ranged{border-radius:0;background:#edf3ff;color:#2863db}.calendar-grid button.selected{background:#3370ff;color:#fff;font-weight:600}.calendar-grid button.today:not(.selected)::after{content:"";position:absolute;bottom:3px;left:50%;width:3px;height:3px;border-radius:50%;background:#3370ff;transform:translateX(-50%)}.date-selection{min-height:18px;margin:7px 2px;color:#77818e;font-size:11px;text-align:center}.calendar-actions{display:flex;justify-content:flex-end;gap:8px;padding-top:9px;border-top:1px solid #edf0f3}.calendar-actions button{min-width:58px;padding:7px 12px;border-radius:7px;color:#687382;font-size:12px}.calendar-actions .primary{background:#3370ff;color:#fff}.calendar-actions .primary:disabled{background:#b7c7e6}.result-head{margin-top:15px}.gallery-item{width:100%;text-align:left}.gallery-item:active{transform:scale(.99);background:#f9fbff}.gallery-item .thumb{width:78px;height:66px}.file-info{min-width:0;flex:1;gap:4px}.file-info b{font-size:15px;line-height:19px;color:#262b33;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.file-info span{font-size:13px;line-height:17px;color:#505b68;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.file-info small{font-size:12px;line-height:16px;color:#7d8794;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.item-arrow{flex:none;color:#a0a8b2;font-size:22px;font-style:normal}.gallery.grid .gallery-item{position:relative}.gallery.grid .thumb{height:126px}.gallery.grid .file-info{gap:5px}.gallery.grid .file-info b{font-size:14px}.gallery.grid .file-info span{font-size:12px}.gallery.grid .file-info small{font-size:11px}.gallery.grid .item-arrow{display:none}.photo-viewer{position:absolute;z-index:50;inset:0;display:flex;flex-direction:column;background:#111820;color:#fff}.photo-viewer header{height:66px;display:grid;grid-template-columns:44px 1fr 54px;align-items:center;gap:5px;padding:8px 10px;background:#17212b}.photo-viewer header button{color:#fff;font-size:34px;line-height:1}.photo-viewer header div{min-width:0;display:flex;flex-direction:column;gap:2px;text-align:center}.photo-viewer header b{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.photo-viewer header small{color:#b9c1ca;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.photo-viewer header a{padding:7px 9px;border-radius:7px;background:#3370ff;color:#fff;text-align:center;text-decoration:none;font-size:12px}.photo-stage{position:relative;min-height:0;flex:1;overflow:hidden;display:grid;place-items:center;touch-action:none;cursor:grab;background:#0d1319}.photo-stage.dragging{cursor:grabbing}.photo-stage img{position:absolute;max-width:100%;max-height:100%;user-select:none;-webkit-user-drag:none}.viewer-preview{opacity:.66;filter:blur(1px)}.viewer-full{opacity:0;transform-origin:center;transition:opacity .18s ease,transform .12s ease-out}.viewer-full.loaded{opacity:1}.photo-stage.dragging .viewer-full{transition:opacity .18s ease}.hd-loading{position:absolute;bottom:18px;padding:6px 10px;border-radius:14px;background:#101820b8;color:#d7dce2;font-size:11px}.zoom-controls{height:64px;display:flex;align-items:center;justify-content:center;gap:9px;background:#17212b}.zoom-controls button{min-width:44px;height:36px;padding:0 10px;border-radius:9px;background:#283542;color:#fff;font-size:18px}.zoom-controls button:nth-child(2){min-width:66px;font-size:12px}.zoom-controls button:disabled{opacity:.35}
 .photo-stage img{transform-origin:center;will-change:transform}.viewer-preview{transition:transform .12s ease-out}.photo-stage.dragging img{transition:none}.gesture-hint{position:absolute;bottom:18px;padding:7px 11px;border-radius:16px;background:#101820b8;color:#e1e5ea;font-size:11px;pointer-events:none}.zoom-level{position:absolute;right:12px;top:12px;min-width:48px;padding:5px 8px;border-radius:14px;background:#101820b8;color:#fff;text-align:center;font-size:11px;pointer-events:none}.zoom-controls{display:none}
+.todo-card.interactive{cursor:pointer;transition:transform .12s ease,box-shadow .12s ease}.todo-card.interactive:active{transform:scale(.99);box-shadow:0 2px 8px #17233c12}.todo-card:focus{outline:none}.todo-card:focus-visible{box-shadow:0 0 0 3px #3370ff26,0 5px 18px #17233c0b}.capture-topbar{display:grid;grid-template-columns:40px 1fr 40px}.capture-topbar strong{text-align:center}.capture-topbar .back{justify-self:start}.screen{padding-bottom:76px}.capture-screen{padding-bottom:190px}.bottom-action{bottom:56px}.nav{height:56px;padding-top:5px}.nav button{min-width:68px;gap:1px;font-size:10px;outline:none;border-radius:8px}.nav button:focus{outline:none}.nav button:focus-visible{background:#edf3ff;box-shadow:inset 0 0 0 2px #dce8ff}.nav i{font-size:18px;line-height:20px}@media(max-width:600px){.capture-screen{padding-bottom:calc(190px + env(safe-area-inset-bottom))}.nav{height:calc(56px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom)}.bottom-action{bottom:calc(56px + env(safe-area-inset-bottom))}}
 </style>

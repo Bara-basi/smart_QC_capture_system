@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,10 +14,17 @@ from zoneinfo import ZoneInfo
 import asyncpg
 
 from app.core.config import settings
+from app.services.feishu_status_sync import enqueue_status_updates
 
 RULES_PATH = Path(__file__).resolve().parents[2] / "data" / "require_mapping.json"
 DONE_STATUSES = {"已完成", "已提交", "completed", "submitted"}
 CAPTURE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+@dataclass(frozen=True)
+class PhotoCommitResult:
+    photo_ids: list[str]
+    sync_job_ids: list[int]
 
 
 def _dsn() -> str:
@@ -132,6 +140,26 @@ def _task_is_complete(task: asyncpg.Record, captured_items: dict[str, set[str]])
     return mandatory.issubset(captured_items.get(str(task["feishu_record_id"]), set()))
 
 
+def _completion_statuses(
+    tasks: list[Any], captured_items: dict[str, set[str]]
+) -> tuple[list[str], list[str]]:
+    completed_task_ids = [
+        str(task["feishu_record_id"])
+        for task in tasks
+        if _task_is_complete(task, captured_items)
+    ]
+    tasks_by_contract: dict[str, list[str]] = defaultdict(list)
+    for task in tasks:
+        tasks_by_contract[str(task["contract_no"])].append(str(task["feishu_record_id"]))
+    completed_set = set(completed_task_ids)
+    completed_contracts = [
+        contract_no
+        for contract_no, ids_for_contract in tasks_by_contract.items()
+        if ids_for_contract and all(task_id in completed_set for task_id in ids_for_contract)
+    ]
+    return completed_task_ids, completed_contracts
+
+
 async def watermark_task(user_id: str, record_id: str) -> asyncpg.Record:
     """Fetch watermark metadata only when the requested task belongs to the inspector."""
     connection = await asyncpg.connect(_dsn())
@@ -173,8 +201,8 @@ async def create_photo_record(values: dict[str, Any]) -> str:
         await connection.close()
 
 
-async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> list[str]:
-    """Atomically validate ownership and persist an already-uploaded batch."""
+async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> PhotoCommitResult:
+    """Persist photos and transactionally queue any newly completed Feishu statuses."""
     connection = await asyncpg.connect(_dsn())
     try:
         async with connection.transaction():
@@ -210,7 +238,59 @@ async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> li
                     value["sha256"], json.dumps(value["metadata"], ensure_ascii=False), value["search_text"],
                 )
                 ids.append(str(record["id"]))
-            return ids
+            contract_numbers = sorted({str(task["contract_no"]) for task in tasks})
+            contract_tasks = await connection.fetch(
+                """SELECT feishu_record_id, contract_no, product_type
+                   FROM inspection_photo_tasks
+                   WHERE contract_no = ANY($1::text[])""",
+                contract_numbers,
+            )
+            contract_task_ids = [str(task["feishu_record_id"]) for task in contract_tasks]
+            photo_items = await connection.fetch(
+                """SELECT task_feishu_record_id, inspection_item
+                   FROM photo_records
+                   WHERE task_feishu_record_id = ANY($1::varchar[])""",
+                contract_task_ids,
+            )
+            captured_items: dict[str, set[str]] = defaultdict(set)
+            for photo in photo_items:
+                captured_items[str(photo["task_feishu_record_id"])].add(str(photo["inspection_item"]))
+
+            completed_task_ids, completed_contracts = _completion_statuses(contract_tasks, captured_items)
+            if completed_task_ids:
+                await connection.execute(
+                    """UPDATE inspection_photo_tasks SET inspection_status = $2
+                       WHERE feishu_record_id = ANY($1::varchar[])""",
+                    completed_task_ids,
+                    "已提交",
+                )
+
+            order_record_ids: list[str] = []
+            if completed_contracts:
+                order_rows = await connection.fetch(
+                    """UPDATE order_items SET inspection_status = $2
+                       WHERE contract_no = ANY($1::varchar[])
+                       RETURNING feishu_record_id""",
+                    completed_contracts,
+                    "已提交",
+                )
+                order_record_ids = [str(row["feishu_record_id"]) for row in order_rows]
+
+            sync_job_ids = await enqueue_status_updates(
+                connection,
+                table_id=settings.feishu_bitable_table_id,
+                field_id=settings.feishu_bitable_inspection_task_status_field_id,
+                record_ids=completed_task_ids,
+            )
+            sync_job_ids.extend(
+                await enqueue_status_updates(
+                    connection,
+                    table_id=settings.feishu_bitable_order_table_id,
+                    field_id=settings.feishu_bitable_order_status_field_id,
+                    record_ids=order_record_ids,
+                )
+            )
+            return PhotoCommitResult(photo_ids=ids, sync_job_ids=sync_job_ids)
     finally:
         await connection.close()
 

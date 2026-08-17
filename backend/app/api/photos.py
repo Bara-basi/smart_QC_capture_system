@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -12,9 +13,17 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from app.core.config import settings
 from app.integrations.aliyun_oss import OssError, delete_image, upload_image
 from app.services.dashboard_repository import commit_photo_records, commit_task_metadata
-from app.services.watermark import WatermarkError, factory_initials, render_thumbnail, render_watermark, watermark_lines
+from app.services.feishu_status_sync import sync_pending_statuses
+from app.services.watermark import (
+    WatermarkError,
+    factory_initials,
+    render_thumbnail,
+    render_watermark,
+    watermark_lines,
+)
 
 router = APIRouter(prefix="/photos", tags=["photos"])
+logger = logging.getLogger(__name__)
 
 
 @router.get("")
@@ -89,7 +98,7 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
             uploaded.append((settings.oss_bucket, str(photo["oss_object_key"])))
             upload_image(settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"]))
             uploaded.append((settings.oss_preview_bucket, str(photo["preview_oss_object_key"])))
-        records = await commit_photo_records(str(user_id), prepared)
+        commit_result = await commit_photo_records(str(user_id), prepared)
     except (OssError, Exception) as exc:
         for bucket, object_key in reversed(uploaded):
             try:
@@ -99,7 +108,18 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         if isinstance(exc, OssError):
             raise HTTPException(status_code=502, detail="Photo upload failed; no photos were saved") from exc
         raise HTTPException(status_code=500, detail="Photo metadata could not be saved; no photos were saved") from exc
-    return {"photo_ids": records, "count": len(records)}
+    try:
+        feishu_sync = await sync_pending_statuses(commit_result.sync_job_ids)
+    except Exception:
+        # Photos and the durable outbox are already committed. Never report an
+        # upload failure here, otherwise the client may upload the same batch twice.
+        logger.exception("Immediate Feishu status synchronization failed; queued for retry")
+        feishu_sync = {"synced": 0, "pending": len(commit_result.sync_job_ids)}
+    return {
+        "photo_ids": commit_result.photo_ids,
+        "count": len(commit_result.photo_ids),
+        "feishu_sync": feishu_sync,
+    }
 
 
 @router.delete("/{photo_id}")

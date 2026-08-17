@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     feishu_bitable_order_table_id: str = ""
     feishu_bitable_order_view_id: str = ""
     feishu_bitable_inspection_task_view_id: str = ""
+    feishu_bitable_order_status_field_id: str = ""
+    feishu_bitable_inspection_task_status_field_id: str = ""
+    feishu_status_sync_interval_seconds: int = 60
     feishu_sync_webhook_secret: str = ""
     oss_endpoint: str = ""
     oss_bucket: str = ""

@@ -99,6 +99,21 @@ CREATE TABLE photo_records (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE feishu_status_sync_outbox (
+    id BIGSERIAL PRIMARY KEY,
+    table_id VARCHAR(128) NOT NULL,
+    record_id VARCHAR(128) NOT NULL,
+    field_id VARCHAR(128) NOT NULL,
+    field_value TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    synced_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (table_id, record_id, field_id, field_value)
+);
+
 CREATE INDEX ix_order_items_contract_product ON order_items (contract_no, product_type);
 CREATE INDEX ix_order_items_inspector_status ON order_items (inspector_union_id, inspection_status);
 CREATE INDEX ix_photo_tasks_contract_product ON inspection_photo_tasks (contract_no, product_type);
@@ -107,6 +122,7 @@ CREATE INDEX ix_photo_records_contract ON photo_records (contract_no, captured_a
 CREATE INDEX ix_photo_records_lookup ON photo_records (factory_initials, product_type, inspection_item, captured_at DESC);
 CREATE INDEX ix_photo_records_search ON photo_records USING GIN (to_tsvector('simple', search_text));
 CREATE INDEX ix_photo_records_search_trgm ON photo_records USING GIN (search_text gin_trgm_ops);
+CREATE INDEX ix_feishu_status_sync_pending ON feishu_status_sync_outbox (next_attempt_at, id) WHERE synced_at IS NULL;
 
 CREATE OR REPLACE FUNCTION set_updated_at()
 RETURNS TRIGGER AS $$ BEGIN NEW.updated_at = NOW(); RETURN NEW; END; $$ LANGUAGE plpgsql;
