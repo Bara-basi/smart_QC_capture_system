@@ -249,6 +249,7 @@ class ErpPurchaseClient:
         self.password = password
         self.timeout = timeout
         self._client = self._load_or_login()
+        self._retired_clients: list[httpx.Client] = []
         self._reauth_lock = threading.Lock()
         self._count_lock = threading.Lock()
         self.request_count = 0
@@ -290,7 +291,8 @@ class ErpPurchaseClient:
 
     def close(self) -> None:
         self._persist_current_session()
-        self._client.close()
+        for client in [self._client, *self._retired_clients]:
+            client.close()
 
     def _persist_current_session(self) -> None:
         cookies = _cookies_from_client(self._client)
@@ -318,9 +320,13 @@ class ErpPurchaseClient:
 
     def request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         for attempt in range(2):
+            # httpx.Client supports concurrent requests. Keep a reference to
+            # the client used by this attempt so a re-login never closes it
+            # while another detail-worker is still receiving a response.
+            client = self._client
             with self._count_lock:
                 self.request_count += 1
-            response = self._client.request(
+            response = client.request(
                 method, urljoin(self.base_url, path), **kwargs
             )
             if not self._is_auth_failure(response):
@@ -329,8 +335,10 @@ class ErpPurchaseClient:
             if attempt == 1:
                 break
             with self._reauth_lock:
-                self._client.close()
-                self._client = self._login_again()
+                # A different worker may already have refreshed the session.
+                if client is self._client:
+                    self._retired_clients.append(client)
+                    self._client = self._login_again()
         raise ErpAuthenticationError("ERP rejected the saved session after renewal")
 
     def purchase_summaries(self) -> list[PurchaseSummary]:
@@ -711,7 +719,7 @@ def _task_write_plan(
                 {
                     "fields": {
                         "合同号": order.purchase_code,
-                        "序号": float(task.sequence),
+                        "序号": _bitable_sequence(task.sequence),
                         "产品类型": task.product_type,
                         "规格": task.specification,
                         "数量": task.quantity,
@@ -721,6 +729,15 @@ def _task_write_plan(
             )
             existing_keys.add(key)
     return create_records, update_records
+
+
+def _bitable_sequence(sequence: str) -> float | str:
+    """Keep alphanumeric ERP sequences instead of aborting the whole sync."""
+    try:
+        value = float(sequence)
+    except (TypeError, ValueError):
+        return sequence
+    return value if math.isfinite(value) else sequence
 
 
 def sync_to_feishu(

@@ -14,7 +14,10 @@ from fastapi import APIRouter, File, Form, HTTPException, Query, Request, Upload
 from app.core.config import settings
 from app.integrations.aliyun_oss import OssError, delete_image, upload_image
 from app.services.dashboard_repository import commit_photo_records, commit_task_metadata
-from app.services.feishu_status_sync import sync_pending_statuses
+from app.services.feishu_status_sync import (
+    FeishuStatusSyncConfigurationError,
+    sync_pending_statuses,
+)
 from app.services.watermark import (
     WatermarkError,
     factory_initials,
@@ -104,14 +107,14 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
                 asyncio.to_thread(upload_image, settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"])),
             )
         commit_result = await commit_photo_records(str(user_id), prepared)
-    except (OssError, Exception) as exc:
-        for bucket, object_key in reversed(uploaded):
-            try:
-                await asyncio.to_thread(delete_image, bucket, object_key)
-            except Exception:
-                pass
-        if isinstance(exc, OssError):
-            raise HTTPException(status_code=502, detail="Photo upload failed; no photos were saved") from exc
+    except FeishuStatusSyncConfigurationError as exc:
+        await _cleanup_uploaded(uploaded)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except OssError as exc:
+        await _cleanup_uploaded(uploaded)
+        raise HTTPException(status_code=502, detail="Photo upload failed; no photos were saved") from exc
+    except Exception as exc:
+        await _cleanup_uploaded(uploaded)
         raise HTTPException(status_code=500, detail="Photo metadata could not be saved; no photos were saved") from exc
     try:
         feishu_sync = await sync_pending_statuses(commit_result.sync_job_ids)
@@ -125,6 +128,14 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         "count": len(commit_result.photo_ids),
         "feishu_sync": feishu_sync,
     }
+
+
+async def _cleanup_uploaded(uploaded: list[tuple[str, str]]) -> None:
+    for bucket, object_key in reversed(uploaded):
+        try:
+            await asyncio.to_thread(delete_image, bucket, object_key)
+        except Exception:
+            logger.exception("Could not remove failed upload object %s", object_key)
 
 
 @router.delete("/{photo_id}")

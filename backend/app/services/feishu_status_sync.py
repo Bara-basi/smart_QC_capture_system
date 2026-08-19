@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 SUBMITTED_STATUS = "已提交"
 
 
+class FeishuStatusSyncConfigurationError(RuntimeError):
+    """Raised when a completed record cannot be queued for Feishu delivery."""
+
+
 def _dsn() -> str:
     return settings.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
@@ -30,8 +34,17 @@ async def enqueue_status_updates(
     record_ids: list[str],
 ) -> list[int]:
     """Add idempotent status updates inside the caller's database transaction."""
-    if not table_id or not field_id or not record_ids:
+    if not record_ids:
         return []
+    missing = []
+    if not table_id:
+        missing.append("Bitable table ID")
+    if not field_id:
+        missing.append("Bitable status field ID")
+    if missing:
+        message = f"Cannot queue completed Feishu status updates: missing {', '.join(missing)}"
+        logger.error(message)
+        raise FeishuStatusSyncConfigurationError(message)
     job_ids: list[int] = []
     for record_id in sorted(set(record_ids)):
         row = await connection.fetchrow(
@@ -56,53 +69,57 @@ async def sync_pending_statuses(job_ids: list[int] | None = None, limit: int = 1
         return {"synced": 0, "pending": 0}
     connection = await asyncpg.connect(_dsn())
     try:
-        if job_ids:
-            rows = await connection.fetch(
-                """SELECT id, table_id, record_id, field_id, field_value, attempts
-                   FROM feishu_status_sync_outbox
-                   WHERE synced_at IS NULL AND id = ANY($1::bigint[])
-                   ORDER BY id LIMIT $2""",
-                job_ids,
-                limit,
-            )
-        else:
-            rows = await connection.fetch(
-                """SELECT id, table_id, record_id, field_id, field_value, attempts
-                   FROM feishu_status_sync_outbox
-                   WHERE synced_at IS NULL AND next_attempt_at <= NOW()
-                   ORDER BY id LIMIT $1""",
-                limit,
-            )
-        grouped: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
-        for row in rows:
-            grouped[(str(row["table_id"]), str(row["field_id"]), str(row["field_value"]))].append(row)
-
-        synced = 0
-        client = FeishuBitableClient()
-        for (table_id, field_id, value), jobs in grouped.items():
-            ids = [int(job["id"]) for job in jobs]
-            try:
-                await client.update_record_field(table_id, field_id, [str(job["record_id"]) for job in jobs], value)
-            except (FeishuBitableError, httpx.HTTPError) as exc:
-                retry_at = datetime.now(UTC) + timedelta(seconds=min(3600, 30 * (2 ** min(int(jobs[0].get("attempts", 0)), 7))))
-                await connection.execute(
-                    """UPDATE feishu_status_sync_outbox
-                       SET attempts = attempts + 1, next_attempt_at = $2, last_error = $3, updated_at = NOW()
-                       WHERE id = ANY($1::bigint[])""",
-                    ids,
-                    retry_at,
-                    str(exc)[:1000],
+        # Keep the transaction open while delivering the batch. A concurrent
+        # worker/request skips these rows instead of sending the same Bitable
+        # update twice.
+        async with connection.transaction():
+            if job_ids:
+                rows = await connection.fetch(
+                    """SELECT id, table_id, record_id, field_id, field_value, attempts
+                       FROM feishu_status_sync_outbox
+                       WHERE synced_at IS NULL AND id = ANY($1::bigint[])
+                       ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED""",
+                    job_ids,
+                    limit,
                 )
-                logger.warning("Feishu status update remains queued for table %s: %s", table_id, exc)
             else:
-                await connection.execute(
-                    """UPDATE feishu_status_sync_outbox
-                       SET synced_at = NOW(), last_error = NULL, updated_at = NOW()
-                       WHERE id = ANY($1::bigint[])""",
-                    ids,
+                rows = await connection.fetch(
+                    """SELECT id, table_id, record_id, field_id, field_value, attempts
+                       FROM feishu_status_sync_outbox
+                       WHERE synced_at IS NULL AND next_attempt_at <= NOW()
+                       ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED""",
+                    limit,
                 )
-                synced += len(ids)
-        return {"synced": synced, "pending": len(rows) - synced}
+            grouped: dict[tuple[str, str, str], list[Any]] = defaultdict(list)
+            for row in rows:
+                grouped[(str(row["table_id"]), str(row["field_id"]), str(row["field_value"]))].append(row)
+
+            synced = 0
+            client = FeishuBitableClient()
+            for (table_id, field_id, value), jobs in grouped.items():
+                ids = [int(job["id"]) for job in jobs]
+                try:
+                    await client.update_record_field(table_id, field_id, [str(job["record_id"]) for job in jobs], value)
+                except (FeishuBitableError, httpx.HTTPError) as exc:
+                    retry_at = datetime.now(UTC) + timedelta(seconds=min(3600, 30 * (2 ** min(int(jobs[0].get("attempts", 0)), 7))))
+                    await connection.execute(
+                        """UPDATE feishu_status_sync_outbox
+                           SET attempts = attempts + 1, next_attempt_at = $2, last_error = $3, updated_at = NOW()
+                           WHERE id = ANY($1::bigint[])""",
+                        ids,
+                        retry_at,
+                        str(exc)[:1000],
+                    )
+                    logger.warning("Feishu status update remains queued for table %s: %s", table_id, exc)
+                else:
+                    await connection.execute(
+                        """UPDATE feishu_status_sync_outbox
+                           SET synced_at = NOW(), last_error = NULL, updated_at = NOW()
+                           WHERE id = ANY($1::bigint[])""",
+                        ids,
+                    )
+                    synced += len(ids)
+            return {"synced": synced, "pending": len(rows) - synced}
     finally:
         await connection.close()
 

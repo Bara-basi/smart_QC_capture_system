@@ -69,3 +69,15 @@ def test_unchanged_stage_is_not_written_again() -> None:
 
     assert creates == []
     assert updates == []
+
+
+def test_non_numeric_erp_sequence_is_preserved() -> None:
+    order = _order()
+    task = order.tasks[0]
+    alphanumeric_order = PurchaseOrder(
+        **{**order.__dict__, "tasks": [ProductTask(**{**task.__dict__, "sequence": "A1"})]}
+    )
+
+    creates, _ = _task_write_plan([], [alphanumeric_order], {})
+
+    assert creates[0]["fields"]["序号"] == "A1"
