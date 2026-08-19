@@ -32,7 +32,7 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      APP_DOMAIN: ${APP_DOMAIN}
+      APP_ORIGIN: ${APP_ORIGIN}
       ACME_EMAIL: ${ACME_EMAIL}
     depends_on:
       - api

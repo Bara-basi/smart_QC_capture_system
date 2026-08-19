@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -75,8 +76,10 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         task = task_map[str(item["task_feishu_record_id"])]
         captured_at = datetime.now(UTC).astimezone()
         try:
-            watermarked, content_type = render_watermark(image, watermark_lines(task["contract_no"], task["sequence_no"], task["specification"], captured_at))
-            preview = render_thumbnail(watermarked)
+            watermarked, content_type = await asyncio.to_thread(
+                render_watermark, image, watermark_lines(task["contract_no"], task["sequence_no"], task["specification"], captured_at)
+            )
+            preview = await asyncio.to_thread(render_thumbnail, watermarked)
         except WatermarkError as exc:
             raise HTTPException(status_code=415, detail=str(exc)) from exc
         object_key, preview_key = _object_keys(str(task["contract_no"]), str(item["task_feishu_record_id"]))
@@ -94,15 +97,17 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
     uploaded: list[tuple[str, str]] = []
     try:
         for photo in prepared:
-            upload_image(settings.oss_bucket, str(photo["oss_object_key"]), bytes(photo["watermarked"]), str(photo["content_type"]))
             uploaded.append((settings.oss_bucket, str(photo["oss_object_key"])))
-            upload_image(settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"]))
             uploaded.append((settings.oss_preview_bucket, str(photo["preview_oss_object_key"])))
+            await asyncio.gather(
+                asyncio.to_thread(upload_image, settings.oss_bucket, str(photo["oss_object_key"]), bytes(photo["watermarked"]), str(photo["content_type"])),
+                asyncio.to_thread(upload_image, settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"])),
+            )
         commit_result = await commit_photo_records(str(user_id), prepared)
     except (OssError, Exception) as exc:
         for bucket, object_key in reversed(uploaded):
             try:
-                delete_image(bucket, object_key)
+                await asyncio.to_thread(delete_image, bucket, object_key)
             except Exception:
                 pass
         if isinstance(exc, OssError):

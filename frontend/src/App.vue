@@ -67,6 +67,9 @@ const partOptions = [
 ]
 let gallerySearchTimer = 0
 let jsapiReady: Promise<void> | null = null
+const DEFAULT_REQUEST_TIMEOUT_MS = 20_000
+const UPLOAD_REQUEST_TIMEOUT_MS = 180_000
+const MAX_UPLOAD_DIMENSION = 1920
 
 const surname = computed(() => dashboard.value?.user.name?.slice(0, 1) || '质')
 const greeting = computed(() => {
@@ -99,10 +102,26 @@ function formatDate(value: string) {
 }
 
 async function request<T>(url: string): Promise<T> {
-  const response = await fetch(url, { credentials: 'include' })
-  if (response.status === 401) window.location.replace('/api/v1/auth/feishu/login')
+  const response = await fetchWithTimeout(url, { credentials: 'include' })
+  if (response.status === 401) {
+    window.location.replace('/api/v1/auth/feishu/login')
+    throw new Error('登录已过期，正在跳转到飞书登录')
+  }
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '加载失败')
   return response.json()
+}
+
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } catch (cause) {
+    if (controller.signal.aborted) throw new Error('网络连接超时，请检查网络后重试')
+    throw cause
+  } finally {
+    window.clearTimeout(timer)
+  }
 }
 
 async function loadDashboard() {
@@ -373,9 +392,10 @@ async function configureFeishuJsapi() {
     if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '飞书拍照服务初始化失败')
     const signature = await response.json()
     await new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(() => reject(new Error('飞书拍照服务初始化超时，请检查网络后重试')), 12_000)
       window.h5sdk!.config({ appId: signature.app_id, timestamp: signature.timestamp, nonceStr: signature.noncestr, signature: signature.signature, jsApiList: ['chooseImage'] })
-      window.h5sdk!.ready(resolve)
-      window.h5sdk!.error?.(reject)
+      window.h5sdk!.ready(() => { window.clearTimeout(timer); resolve() })
+      window.h5sdk!.error?.((cause) => { window.clearTimeout(timer); reject(cause) })
     })
   })()
   try { await jsapiReady } catch (error) { jsapiReady = null; throw error }
@@ -390,11 +410,11 @@ async function addPhoto(taskId: string, requirement: string) {
     if (!localPath) return
     const task = activeTask.value?.tasks.find(item => item.feishu_record_id === taskId)
     if (!task || !activeTask.value) throw new Error('拍照任务已失效，请返回后重新进入')
-    const image = await readTemporaryPhoto(localPath)
+    const image = await optimizePhotoForUpload(await readTemporaryPhoto(localPath))
     const capturedAt = new Date().toISOString()
     const draft: PhotoDraft = { id: crypto.randomUUID(), contractNo: activeTask.value.contract_no, taskId, inspectionItem: requirement, capturedAt, image, createdAt: Date.now() }
     await saveDraft(draft)
-    const imageUrl = await draftPreview(draft, task)
+    const imageUrl = draftPreview(draft)
     const list = photos.value[photoKey(taskId, requirement)] ||= []
     list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, requirement), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: imageUrl, draftId: draft.id })
   } catch (cause) {
@@ -425,8 +445,39 @@ async function readTemporaryPhoto(filePath: string): Promise<Blob> {
   const manager = window.tt?.getFileSystemManager?.()
   if (!manager) throw new Error('当前飞书版本不支持读取临时照片，请升级飞书后重试')
   const base64 = await new Promise<string>((resolve, reject) => manager.readFile({ filePath, encoding: 'base64', success: ({ data }) => typeof data === 'string' ? resolve(data) : reject(new Error('临时照片格式不受支持')), fail: reject }))
-  const bytes = Uint8Array.from(atob(base64), char => char.charCodeAt(0))
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
   return new Blob([bytes], { type: 'image/jpeg' })
+}
+
+async function optimizePhotoForUpload(source: Blob): Promise<Blob> {
+  const sourceUrl = URL.createObjectURL(source)
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image()
+      element.onload = () => resolve(element)
+      element.onerror = () => reject(new Error('无法读取拍摄的图片'))
+      element.src = sourceUrl
+    })
+    const longestSide = Math.max(image.naturalWidth, image.naturalHeight)
+    if (longestSide <= MAX_UPLOAD_DIMENSION && source.size <= 3 * 1024 * 1024) return source
+    const scale = Math.min(1, MAX_UPLOAD_DIMENSION / longestSide)
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(image.naturalWidth * scale))
+    canvas.height = Math.max(1, Math.round(image.naturalHeight * scale))
+    const context = canvas.getContext('2d')
+    if (!context) return source
+    context.drawImage(image, 0, 0, canvas.width, canvas.height)
+    const compressed = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', .82))
+    return compressed && compressed.size < source.size ? compressed : source
+  } catch {
+    // The server still validates and watermarks the original image. Do not
+    // prevent an inspector from submitting if this client-only optimization fails.
+    return source
+  } finally {
+    URL.revokeObjectURL(sourceUrl)
+  }
 }
 
 async function removePhoto(taskId: string, requirement: string, index: number) {
@@ -468,60 +519,26 @@ async function restoreDrafts() {
     const task = taskById.get(draft.taskId)
     if (!task) continue
     const list = photos.value[photoKey(draft.taskId, draft.inspectionItem)] ||= []
-    list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, draft.inspectionItem), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: await draftPreview(draft, task), draftId: draft.id })
+    list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, draft.inspectionItem), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: draftPreview(draft), draftId: draft.id })
   }
 }
 
-async function draftPreview(draft: PhotoDraft, task: ProductTask): Promise<string> {
-  const sourceUrl = URL.createObjectURL(draft.image)
-  const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-    const element = new Image()
-    element.onload = () => resolve(element)
-    element.onerror = () => reject(new Error('无法生成草稿预览'))
-    element.src = sourceUrl
-  })
-  const canvas = document.createElement('canvas')
-  canvas.width = image.naturalWidth
-  canvas.height = image.naturalHeight
-  const context = canvas.getContext('2d')
-  if (!context) throw new Error('当前设备不支持草稿预览')
-  context.drawImage(image, 0, 0)
-  const factory = draft.contractNo.match(/-(\p{L}+)$/u)?.[1]?.toUpperCase()
-  const contract = draft.contractNo.replace(/-(\p{L}+)$/u, '').replace(/-/g, '').toUpperCase()
-  const line1 = `${factory ? `${factory}-` : ''}${contract}-${task.sequence_no || ''}`.replace(/-$/, '')
-  const line2 = (task.specification || '未填写规格').trim().split(/\s+/).slice(0, 2).join('-')
-  const captured = new Date(draft.capturedAt)
-  const line3 = `${captured.getFullYear()}.${String(captured.getMonth() + 1).padStart(2, '0')}.${String(captured.getDate()).padStart(2, '0')} ${String(captured.getHours()).padStart(2, '0')}:${String(captured.getMinutes()).padStart(2, '0')}`
-  const size = Math.max(20, Math.min(54, Math.round(Math.min(canvas.width, canvas.height) * 0.045)))
-  context.font = `${size}px sans-serif`
-  context.textBaseline = 'top'
-  context.lineWidth = Math.max(1, Math.floor(size / 14))
-  const lines = [line1, line2, line3]
-  const x = Math.max(18, Math.floor(size / 2))
-  const y = canvas.height - Math.max(18, Math.floor(size / 2)) - lines.length * (size + Math.floor(size / 4))
-  lines.forEach((line, index) => {
-    const top = y + index * (size + Math.floor(size / 4))
-    context.strokeStyle = '#000'
-    context.fillStyle = '#fff'
-    context.strokeText(line, x, top)
-    context.fillText(line, x, top)
-  })
-  URL.revokeObjectURL(sourceUrl)
-  return URL.createObjectURL(await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('草稿预览生成失败')), 'image/jpeg', .9)))
+function draftPreview(draft: PhotoDraft): string {
+  return URL.createObjectURL(draft.image)
 }
 
 async function submitPhotos(taskId: string) {
   if (!activeTask.value || isSubmitting.value || uploadedTaskIds.value.has(taskId)) return
   submitError.value = ''
   submitStatus.value = 'uploading'
-  const drafts = (await draftsForContract(activeTask.value.contract_no)).filter(draft => draft.taskId === taskId)
-  if (!drafts.length) return
   isSubmitting.value = true
   try {
+    const drafts = (await draftsForContract(activeTask.value.contract_no)).filter(draft => draft.taskId === taskId)
+    if (!drafts.length) throw new Error('未找到待上传照片，请重新拍摄')
     const form = new FormData()
     form.append('manifest', JSON.stringify({ contract_no: activeTask.value.contract_no, photos: drafts.map((draft, index) => ({ file_index: index, task_feishu_record_id: draft.taskId, inspection_item: draft.inspectionItem, client_captured_at: draft.capturedAt })) }))
     drafts.forEach((draft, index) => form.append('files', draft.image, `capture-${index}.jpg`))
-    const response = await fetch('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form })
+    const response = await fetchWithTimeout('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form }, UPLOAD_REQUEST_TIMEOUT_MS)
     if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '提交上传失败')
     await removeDrafts(drafts.map(draft => draft.id))
     Object.entries(photos.value).filter(([key]) => key.startsWith(`${taskId}:`)).forEach(([, list]) => list.forEach(photo => URL.revokeObjectURL(photo.url)))
@@ -551,7 +568,10 @@ function onSwipeEnd(event: TouchEvent) {
 }
 
 onMounted(async () => {
-  try { await cleanExpiredDrafts(); await loadDashboard() } catch (cause) { error.value = cause instanceof Error ? cause.message : '加载失败' } finally { isLoading.value = false }
+  // Local draft cleanup must never delay login or the homepage, especially in
+  // iOS WebViews where IndexedDB may be unavailable.
+  void cleanExpiredDrafts()
+  try { await loadDashboard() } catch (cause) { error.value = cause instanceof Error ? cause.message : '加载失败' } finally { isLoading.value = false }
 })
 </script>
 

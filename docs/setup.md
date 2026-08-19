@@ -126,6 +126,23 @@ FastAPI。浏览器访问的仍是 `/api/v1/...`，因此会话 Cookie、JSAPI �
 
 Caddy 会在域名正确解析、80/443 可访问后自动申请和续期 Let's Encrypt 证书。若服务器已有 Nginx/Apache 占用 80 或 443，应停用它，或改由现有反代转发至 Caddy。
 
+### 无域名（公网 IP）模式
+
+若服务器在香港或境外，可使用公网 IP，例如 `http://203.0.113.10`，不需要购买域名。
+将 `.env.production` 的 `APP_ORIGIN` 设为该完整地址，并将 `backend/.env` 的
+`WEB_ORIGIN` 设为完全相同的值；Caddy 会以 HTTP 提供服务，不会申请 TLS 证书。
+飞书网页应用首页、可信来源/安全设置和 OAuth 回调地址都必须改为：
+
+```text
+http://203.0.113.10/
+http://203.0.113.10/api/v1/auth/feishu/callback
+```
+
+该模式降低了传输保护等级，建议仅用于企业内部飞书用户和非敏感网络；登录 Cookie
+仍为 HTTP-only，但不会带 Secure 属性。飞书控制台若拒绝 IP 作为网页应用主页或回调
+地址，则该飞书租户只能使用 HTTPS 域名，不能通过代码规避。中国大陆服务器即使仅
+通过 IP 提供网站，通常也需要办理 IP 地址备案；请向服务器接入商确认。
+
 ### 2. 填写配置
 
 在仓库根目录执行：
@@ -136,7 +153,8 @@ cp backend/.env.example backend/.env
 chmod 600 .env.production backend/.env
 ```
 
-编辑 `.env.production`，设置真实域名、运维邮箱及强 PostgreSQL 密码。编辑
+编辑 `.env.production`，设置 `APP_ORIGIN`（域名 HTTPS；IP 模式请使用下文的
+`.env.ip` 与 HTTPS IP 证书）、运维邮箱及强 PostgreSQL 密码。编辑
 `backend/.env` 时至少改为：
 
 ```dotenv
@@ -158,8 +176,8 @@ OSS_ACCESS_KEY_SECRET=<对应密钥>
 
 将以下值配置到同一个自建应用并发布生效：
 
-- H5 首页地址：`https://qc.example.com/`
-- 可信域名：`qc.example.com`
+- H5 首页地址：`https://qc.example.com/`（IP 模式则替换为 `http://公网IP/`）
+- 可信域名：`qc.example.com`（IP 模式按飞书控制台实际允许的 IP 来源配置）
 - OAuth 回调地址：`https://qc.example.com/api/v1/auth/feishu/callback`
 - 多维表格自动化 Webhook：`https://qc.example.com/api/v1/integrations/feishu/order-sync`
 
@@ -189,3 +207,63 @@ done
 ```bash
 docker compose --env-file .env.production -f docker-compose.production.yml logs -f caddy api
 ```
+
+## 无域名部署：公网 IP + HTTPS
+
+如果不想注册或备案域名，可以使用服务器的**固定公网 IP** 访问。不能改用裸
+HTTP 或自签名 HTTPS：飞书对生产服务要求 HTTPS，而 iPhone 通常不会信任自签名
+证书。飞书网页应用文档允许配置公网地址；其社区的 Web 应用示例也展示了 IP
+形式的回调地址。[飞书网页应用配置指南](https://open.feishu.cn/document/uYjL24iN/uMTMuMTMuMTM/development-guide/step1)
+
+Let’s Encrypt 从 2026 年起正式支持公网 IP 证书，但 IP 证书仅有效约 6 天，
+必须自动续期。[Let’s Encrypt 说明](https://letsencrypt.org/2026/01/15/6day-and-ip-general-availability.html)
+本仓库的 `Caddyfile.ip` 和 `docker-compose.ip.yml` 已支持这一模式；证书由宿主机
+上的 Certbot 管理，Caddy 只读取证书。
+
+### IP 模式配置
+
+1. 确保 IP 是固定的公网 IPv4，且 TCP 80、443 从互联网可达；复制
+   `.env.ip.example` 为 `.env.ip`，填写 `APP_IP`、邮箱和数据库密码。
+2. 复制 `backend/.env.example` 为 `backend/.env`，并设置：
+
+   ```dotenv
+   ENVIRONMENT=production
+   DEBUG=false
+   DATABASE_URL=postgresql+asyncpg://qc_user:<URL编码后的数据库密码>@postgres:5432/smart_qc_capture_system
+   WEB_ORIGIN=https://<APP_IP>
+   SECRET_KEY=<至少32字节随机值>
+   ```
+
+3. 在宿主机安装 **Certbot 5.4 或更新版本**。首次申请证书前，80 端口不能被其他
+   服务占用；使用 standalone 方式：
+
+   ```bash
+   sudo certbot certonly --standalone --preferred-profile shortlived --ip-address <APP_IP>
+   ```
+
+   Certbot 的 IP 证书参数和版本要求见其[官方说明](https://letsencrypt.org/2026/03/11/shorter-certs-certbot)。
+
+4. 启动 IP 部署：
+
+   ```bash
+   docker compose --env-file .env.ip \
+     -f docker-compose.production.yml -f docker-compose.ip.yml up -d --build
+   ```
+
+5. 设置宿主机每日续期。首次证书完成后，Caddy 会通过 `certbot-webroot/` 提供 ACME
+   校验文件，因此续期不需要停服务：
+
+   ```bash
+   sudo crontab -e
+   # 每天 03:15 尝试续期；证书更新后让 Caddy 重新加载
+   15 3 * * * certbot renew --quiet --deploy-hook 'cd /opt/smart-qc-capture-system && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
+   ```
+
+飞书后台改为配置：H5 首页 `https://<APP_IP>/`，OAuth 回调
+`https://<APP_IP>/api/v1/auth/feishu/callback`，Webhook
+`https://<APP_IP>/api/v1/integrations/feishu/order-sync`。如果控制台的“可信域名”
+字段不接受 IP，请保留首页/回调为 IP 后先在测试应用验证；该字段的具体校验会随飞书
+租户与控制台版本而变化。
+
+此方案省去自有域名，但不应被视为规避当地法规或云厂商要求；若服务器在中国大陆，
+仍应以云厂商和当地监管对公网 IP 服务的要求为准。

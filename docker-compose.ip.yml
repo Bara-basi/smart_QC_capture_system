@@ -1,0 +1,14 @@
+# Use together with docker-compose.production.yml. It replaces Caddy's
+# domain-based configuration with a public-IP configuration and mounts the
+# host-managed Let's Encrypt certificate.
+services:
+  caddy:
+    environment:
+      APP_IP: ${APP_IP}
+      # The base production compose file also defines this value. Keep it
+      # populated when this override replaces the Caddyfile.
+      APP_ORIGIN: https://${APP_IP}
+    volumes:
+      - ./Caddyfile.ip:/etc/caddy/Caddyfile:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./certbot-webroot:/var/www/certbot:ro

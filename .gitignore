@@ -14,6 +14,7 @@ dist/
 .env.*
 !.env.example
 !.env.production.example
+!.env.ip.example
 data/
 
 # Editors and operating systems

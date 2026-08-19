@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import secrets
 import time
 from dataclasses import dataclass
@@ -46,12 +47,18 @@ def _validate_page_url(url: str) -> None:
         raise FeishuAuthError("WEB_ORIGIN is not configured")
     candidate = urlsplit(url)
     configured = urlsplit(settings.web_origin)
-    if (
-        candidate.scheme != configured.scheme
-        or candidate.netloc != configured.netloc
-        or candidate.scheme != "https"
-    ):
-        raise FeishuAuthError("JSAPI page URL must use the configured HTTPS WEB_ORIGIN")
+    if candidate.scheme != configured.scheme or candidate.netloc != configured.netloc:
+        raise FeishuAuthError("JSAPI page URL must use WEB_ORIGIN")
+    if configured.scheme == "https":
+        return
+    # TLS certificates are issued for domains, not arbitrary IPs. Allow plain
+    # HTTP only for the explicitly configured bare-IP deployment mode.
+    try:
+        ipaddress.ip_address(configured.hostname or "")
+    except ValueError as exc:
+        raise FeishuAuthError("WEB_ORIGIN must use HTTPS unless it is a public IP address") from exc
+    if configured.scheme != "http":
+        raise FeishuAuthError("WEB_ORIGIN must use HTTP or HTTPS")
 
 
 async def _get_ticket() -> str:

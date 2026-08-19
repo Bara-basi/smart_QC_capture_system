@@ -2,7 +2,10 @@
     email {$ACME_EMAIL}
 }
 
-{$APP_DOMAIN} {
+# APP_ORIGIN supports both https://qc.example.com (domain mode) and
+# http://203.0.113.10 (IP mode). Explicit http keeps Caddy from attempting
+# ACME certificates, which cannot be issued for a bare IP address.
+{$APP_ORIGIN} {
     encode zstd gzip
     request_body {
         # FastAPI limits each image to 15 MB; allow a multi-photo submission.
@@ -17,6 +20,11 @@
 
     @health path /health
     reverse_proxy @health api:8000
+
+    # Vite fingerprints production assets. Cache them aggressively so repeat
+    # visits in Feishu's iOS WebView do not re-download the application shell.
+    @assets path /assets/*
+    header @assets Cache-Control "public, max-age=31536000, immutable"
 
     root * /srv
     try_files {path} /index.html
