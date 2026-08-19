@@ -6,6 +6,7 @@ import hashlib
 import secrets
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -26,6 +27,7 @@ async def jsapi_signature(url: str) -> dict[str, str | int]:
     """Return a signature without ever exposing the ticket or app secret."""
     if not settings.feishu_app_id or not settings.feishu_app_secret:
         raise FeishuAuthError("Feishu JSAPI is not configured")
+    _validate_page_url(url)
     ticket = await _get_ticket()
     nonce = secrets.token_urlsafe(16)
     timestamp = int(time.time() * 1000)
@@ -36,6 +38,20 @@ async def jsapi_signature(url: str) -> dict[str, str | int]:
         "timestamp": timestamp,
         "signature": hashlib.sha1(plaintext.encode("utf-8")).hexdigest(),
     }
+
+
+def _validate_page_url(url: str) -> None:
+    """Only sign the configured public H5 origin, never an arbitrary URL."""
+    if not settings.web_origin:
+        raise FeishuAuthError("WEB_ORIGIN is not configured")
+    candidate = urlsplit(url)
+    configured = urlsplit(settings.web_origin)
+    if (
+        candidate.scheme != configured.scheme
+        or candidate.netloc != configured.netloc
+        or candidate.scheme != "https"
+    ):
+        raise FeishuAuthError("JSAPI page URL must use the configured HTTPS WEB_ORIGIN")
 
 
 async def _get_ticket() -> str:

@@ -17,7 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.config import settings  # noqa: E402
 
 DATABASE_NAME = "smart_qc_capture_system"
-SCHEMA_PATH = Path(__file__).resolve().parents[2] / "database" / "init" / "001_schema.sql"
+DATABASE_DIR = Path(__file__).resolve().parents[2] / "database"
+SCHEMA_PATH = DATABASE_DIR / "init" / "001_schema.sql"
+MIGRATION_PATHS = sorted((DATABASE_DIR / "migrations").glob("*.sql"))
 
 
 def asyncpg_dsn() -> str:
@@ -41,6 +43,8 @@ async def main() -> None:
     connection = await asyncpg.connect(dsn=dsn, database=DATABASE_NAME)
     try:
         await connection.execute(SCHEMA_PATH.read_text(encoding="utf-8"))
+        for migration in MIGRATION_PATHS:
+            await connection.execute(migration.read_text(encoding="utf-8"))
         print(f"Schema initialized successfully: {DATABASE_NAME}")
     finally:
         await connection.close()

@@ -4,12 +4,12 @@ import vue from "@vitejs/plugin-vue";
 export default defineConfig({
   plugins: [vue()],
   server: {
-    // The ngrok tunnel targets IPv4 explicitly; do not leave an old IPv6 Vite
-    // process on the same port for localhost to resolve to.
+    // Development only. In production Caddy serves dist/ and routes /api to
+    // FastAPI, so the browser continues to use the same relative API URLs.
     host: "127.0.0.1",
-    allowedHosts: ["shopper-washable-crock.ngrok-free.dev"],
+    allowedHosts: ["localhost", "127.0.0.1", ".ngrok-free.app", ".ngrok-free.dev"],
     proxy: {
-      "/api": "http://127.0.0.1:8000",
+      "/api": process.env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8000",
     },
   },
 });

@@ -109,3 +109,83 @@ columns are preserved in `feishu_fields`; the queryable fields are
 `contract_no`, `product_type`, `inspection_status`, and inspector open/union ID
 and name. On a server, route this HTTPS path directly to FastAPI behind a
 reverse proxy instead of depending on the Vite development proxy.
+
+## 生产服务器部署（Docker Compose + Caddy）
+
+生产环境不需要 ngrok，也不运行 Vite。`docker-compose.production.yml` 会构建 Vue
+静态站点；Caddy 在同一个 HTTPS 域名下提供网页，并将 `/api/*` **直接**反向代理到
+FastAPI。浏览器访问的仍是 `/api/v1/...`，因此会话 Cookie、JSAPI 签名页和 API
+全部同源，不需要 CORS 或开发代理。
+
+### 1. 准备服务器与域名
+
+- 使用可从公网访问的 Linux 服务器，安装 Docker Engine 与 Docker Compose v2。
+- 为 `qc.example.com` 创建 A（需要 IPv6 时再创建 AAAA）记录，指向服务器公网 IP。
+- 云安全组和系统防火墙仅放行 TCP `80`、`443` 与管理用 SSH；不要暴露 `8000`、PostgreSQL 或 Redis。
+- 将仓库复制到服务器，例如 `/opt/smart-qc-capture-system`。生产数据库 Docker volume 应纳入备份策略。
+
+Caddy 会在域名正确解析、80/443 可访问后自动申请和续期 Let's Encrypt 证书。若服务器已有 Nginx/Apache 占用 80 或 443，应停用它，或改由现有反代转发至 Caddy。
+
+### 2. 填写配置
+
+在仓库根目录执行：
+
+```bash
+cp .env.production.example .env.production
+cp backend/.env.example backend/.env
+chmod 600 .env.production backend/.env
+```
+
+编辑 `.env.production`，设置真实域名、运维邮箱及强 PostgreSQL 密码。编辑
+`backend/.env` 时至少改为：
+
+```dotenv
+ENVIRONMENT=production
+DEBUG=false
+DATABASE_URL=postgresql+asyncpg://qc_user:<与POSTGRES_PASSWORD相同的密码>@postgres:5432/smart_qc_capture_system
+WEB_ORIGIN=https://qc.example.com
+SECRET_KEY=<至少32字节的随机值>
+FEISHU_APP_SECRET=<真实值>
+FEISHU_SYNC_WEBHOOK_SECRET=<长随机值>
+OSS_ACCESS_KEY_ID=<RAM子账号或STS凭据>
+OSS_ACCESS_KEY_SECRET=<对应密钥>
+```
+
+密码若含有 `@`、`:`、`/`、`?`、`#` 等字符，必须进行 URL 编码后再写入
+`DATABASE_URL`。`WEB_ORIGIN` 必须是用户实际打开的唯一 HTTPS 地址，且不能带末尾 `/`。
+
+### 3. 配置飞书网页应用
+
+将以下值配置到同一个自建应用并发布生效：
+
+- H5 首页地址：`https://qc.example.com/`
+- 可信域名：`qc.example.com`
+- OAuth 回调地址：`https://qc.example.com/api/v1/auth/feishu/callback`
+- 多维表格自动化 Webhook：`https://qc.example.com/api/v1/integrations/feishu/order-sync`
+
+Webhook 必须带 `X-QC-Sync-Secret`，其值与 `FEISHU_SYNC_WEBHOOK_SECRET`
+一致。前端会以当前完整页面 URL 请求签名；后端只会为 `WEB_ORIGIN` 的 HTTPS
+页面签名，因此域名、协议或端口不一致都会导致 `chooseImage` 失败。
+
+### 4. 启动与验收
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml up -d --build
+docker compose --env-file .env.production -f docker-compose.production.yml ps
+curl -fsS https://qc.example.com/health
+```
+
+首次创建的 PostgreSQL 数据卷会自动执行 `database/init/001_schema.sql`。若迁移的是已有数据库，在发布前按序执行 `database/migrations/*.sql`（先在备份或预发环境验证）。可用容器执行：
+
+```bash
+for f in database/migrations/*.sql; do
+  docker compose --env-file .env.production -f docker-compose.production.yml exec -T postgres \
+    sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < "$f"
+done
+```
+
+验收时在飞书手机客户端打开首页，确认 OAuth 回跳、任务列表、`chooseImage`、上传、缩略图和原图预览均正常；再从飞书多维表格触发一条测试 Webhook。排障日志：
+
+```bash
+docker compose --env-file .env.production -f docker-compose.production.yml logs -f caddy api
+```
