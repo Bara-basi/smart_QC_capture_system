@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref } from 'vue'
+import DesktopGallery from './DesktopGallery.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
 
 type Order = { contract_no: string; started_at: string; task_count: number; pending_count: number; status: string; products: string[]; task_ids: string[] }
@@ -22,6 +23,7 @@ declare global {
 }
 
 const page = ref<'home' | 'capture' | 'gallery'>('home')
+const isDesktopGalleryRoute = window.location.pathname === '/gallery' || window.location.pathname === '/gallery/'
 const dashboard = ref<Dashboard | null>(null)
 const activeTask = ref<CaptureTask | null>(null)
 const isLoading = ref(true)
@@ -568,6 +570,7 @@ function onSwipeEnd(event: TouchEvent) {
 }
 
 onMounted(async () => {
+  if (isDesktopGalleryRoute) return
   // Local draft cleanup must never delay login or the homepage, especially in
   // iOS WebViews where IndexedDB may be unavailable.
   void cleanExpiredDrafts()
@@ -576,7 +579,8 @@ onMounted(async () => {
 </script>
 
 <template>
-  <main class="stage">
+  <DesktopGallery v-if="isDesktopGalleryRoute" />
+  <main v-else class="stage">
     <div class="phone">
       <div v-if="isLoading" class="loading">正在加载任务…</div>
       <div v-else-if="error" class="loading">{{ error }}</div>
