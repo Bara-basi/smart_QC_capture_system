@@ -32,6 +32,7 @@ class FeishuUser:
     union_id: str | None
     tenant_key: str | None
     name: str
+    avatar_url: str | None
     department_ids: list[str]
 
 
@@ -62,15 +63,17 @@ async def exchange_code_and_get_user(code: str) -> FeishuUser:
         user_body = _response_json(user_response, "get user information")
         data = user_body.get("data", user_body)
 
-        user_id = data.get("user_id")
-        if not user_id:
-            raise FeishuAuthError(
-                "Feishu did not return user_id. Enable the self-built-app permission "
-                "'Get user user ID' and approve it, then authorize again."
-            )
         open_id = data.get("open_id")
         if not open_id:
             raise FeishuAuthError("Feishu did not return open_id")
+        # An app-scoped open_id is stable for this tenant and is already the
+        # access-control key used by this service. Some Feishu web-app
+        # installations intentionally do not grant contact:user.id:readonly;
+        # requiring user_id in that case wrongly rejects an otherwise valid
+        # OAuth login.
+        user_id = data.get("user_id") or open_id
+        if not data.get("user_id"):
+            logger.info("Feishu user_info omitted user_id; using open_id as the stable app identity")
 
         department_ids: list[str] = []
         # Disabled by default while the application is being brought online.
@@ -81,12 +84,14 @@ async def exchange_code_and_get_user(code: str) -> FeishuUser:
                 department_ids = await _get_departments(client, user_id)
             except FeishuAuthError as exc:
                 logger.warning("Feishu department sync skipped for user_id=%s: %s", user_id, exc)
+        avatar_url = data.get("avatar_url") or data.get("avatar")
         return FeishuUser(
             user_id=user_id,
             open_id=open_id,
             union_id=data.get("union_id"),
             tenant_key=data.get("tenant_key"),
             name=data.get("name") or user_id,
+            avatar_url=avatar_url if isinstance(avatar_url, str) else None,
             department_ids=department_ids,
         )
 

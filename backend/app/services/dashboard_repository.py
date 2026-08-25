@@ -7,6 +7,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -31,15 +32,20 @@ def _dsn() -> str:
     return settings.database_url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 
-def _requirements(product_type: str | None) -> list[str]:
+@lru_cache(maxsize=1)
+def _requirement_rules() -> tuple[dict[str, list[str]], set[str]]:
     rules = json.loads(RULES_PATH.read_text(encoding="utf-8"))
-    products: dict[str, list[str]] = rules["products"]
+    return rules["products"], set(rules.get("mandatory_items", []))
+
+
+def _requirements(product_type: str | None) -> list[str]:
+    products, _ = _requirement_rules()
     return products.get(product_type or "", products["其它"])
 
 
 def _mandatory_items() -> set[str]:
-    rules = json.loads(RULES_PATH.read_text(encoding="utf-8"))
-    return set(rules.get("mandatory_items", []))
+    _, mandatory_items = _requirement_rules()
+    return mandatory_items
 
 
 def _is_complete(status: str | None) -> bool:
@@ -62,11 +68,13 @@ async def inspector_dashboard(user_id: str) -> dict[str, Any]:
                ORDER BY oi.created_at DESC NULLS LAST, t.created_at DESC""",
             user["open_id"],
         )
+        task_ids = [str(row["feishu_record_id"]) for row in rows]
         photo_rows = await connection.fetch(
             """SELECT p.task_feishu_record_id, p.inspection_item FROM photo_records p
-               WHERE p.photographer_open_id = $1 AND p.task_feishu_record_id IS NOT NULL""",
-            user["open_id"],
-        )
+               WHERE p.photographer_open_id = $1
+                 AND p.task_feishu_record_id = ANY($2::varchar[])""",
+            user["open_id"], task_ids,
+        ) if task_ids else []
         captured_items: dict[str, set[str]] = defaultdict(set)
         for photo in photo_rows:
             captured_items[str(photo["task_feishu_record_id"])].add(str(photo["inspection_item"]))

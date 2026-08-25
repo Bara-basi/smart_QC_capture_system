@@ -20,6 +20,7 @@ CREATE TABLE users (
     open_id VARCHAR(128) NOT NULL UNIQUE,
     union_id VARCHAR(128),
     name VARCHAR(100) NOT NULL,
+    avatar_url TEXT,
     department_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
     character user_character NOT NULL DEFAULT 'inspector',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,

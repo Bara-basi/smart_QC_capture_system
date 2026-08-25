@@ -9,7 +9,10 @@ export default defineConfig({
     host: "127.0.0.1",
     allowedHosts: ["localhost", "127.0.0.1", ".ngrok-free.app", ".ngrok-free.dev"],
     proxy: {
-      "/api": process.env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8000",
+      // Port 8000 is commonly occupied by other local tools. Keep this
+      // project's development API on 8001; production still uses Caddy and
+      // the Docker-internal api:8000 address.
+      "/api": process.env.VITE_API_PROXY_TARGET || "http://127.0.0.1:8001",
     },
   },
 });

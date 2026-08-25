@@ -27,7 +27,7 @@
 生产部署建议拆分为：Vue 构建后的静态文件、无状态 FastAPI 服务、独立 PostgreSQL、独立 Redis（如启用）、OSS。先部署数据库迁移，再发布 API 和前端。
 # Feishu web login (local development with one ngrok tunnel)
 
-Start FastAPI on port 8000 and Vite on port 5173. Vite proxies every `/api/*`
+Start FastAPI on port 8001 and Vite on port 5173. Vite proxies every `/api/*`
 request to FastAPI, so expose **only port 5173**. Target IPv4 explicitly to
 avoid a stale IPv6 Vite process being selected by `localhost`:
 
@@ -44,16 +44,17 @@ https://example.ngrok-free.app/api/v1/auth/feishu/callback
 ```
 
 In the Feishu developer console, enable web OAuth / web application login and
-request and publish the self-built-app permissions **Get user user ID** and the
-required Contact permission for reading a user's employment/department data.
-The former is required by the implementation: `user_id` is stable for one user
-within a tenant across Feishu apps. The system additionally records `open_id`
-(app-specific), `union_id` (developer-scoped), and `open_department_id` values.
+request the needed Contact permissions for reading organization data. The login
+flow uses the app-scoped `open_id` as a safe fallback when the optional **Get
+user user ID** permission is not available, so basic website login is not
+blocked by that permission. The system additionally records `user_id` when
+provided, `union_id` (developer-scoped), and `open_department_id` values.
 
 At the web application's root path, the client checks its session and redirects
 unauthenticated visitors to Feishu automatically. After the callback succeeds,
-the user is upserted to PostgreSQL as an `inspector` and receives an eight-hour
-signed, HTTP-only session cookie. User and tenant tokens are not stored.
+the user is returned to the application page that initiated login (for example
+`/gallery`), is upserted to PostgreSQL as an `inspector`, and receives an
+eight-hour signed, HTTP-only session cookie. User and tenant tokens are not stored.
 
 ## Permissions for the initial user record
 

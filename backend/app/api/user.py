@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import secrets
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import RedirectResponse
@@ -26,15 +26,30 @@ def state_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.secret_key, salt="feishu-oauth-state")
 
 
+def safe_return_path(value: str | None) -> str:
+    """Accept only an application-local OAuth return path.
+
+    The path is carried in the signed OAuth state because Feishu may not retain
+    the session cookie during its authorization round-trip. Rejecting absolute
+    URLs here prevents this endpoint from becoming an open redirector.
+    """
+    if not value:
+        return "/"
+    parsed = urlsplit(value)
+    if parsed.scheme or parsed.netloc or not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return "/"
+    return value
+
+
 @router.get("/feishu/login")
-async def feishu_login(request: Request) -> RedirectResponse:
+async def feishu_login(request: Request, next: str | None = None) -> RedirectResponse:
     if not settings.feishu_app_id or not settings.feishu_app_secret:
         raise HTTPException(status_code=500, detail="Feishu OAuth is not configured")
 
     # The state is signed and short-lived, rather than stored in a browser
     # session. Feishu's embedded WebView may not retain a third-party session
     # cookie across the authorization redirect.
-    state = state_serializer().dumps({"nonce": secrets.token_urlsafe(32)})
+    state = state_serializer().dumps({"nonce": secrets.token_urlsafe(32), "return_path": safe_return_path(next)})
     query = urlencode(
         {
             "client_id": settings.feishu_app_id,
@@ -54,7 +69,7 @@ async def feishu_callback(request: Request, code: str | None = None, state: str 
     if not code or not state:
         raise HTTPException(status_code=400, detail="Invalid or expired Feishu OAuth state")
     try:
-        state_serializer().loads(state, max_age=600)
+        state_data = state_serializer().loads(state, max_age=600)
     except BadData as exc:
         raise HTTPException(status_code=400, detail="Invalid or expired Feishu OAuth state") from exc
 
@@ -67,7 +82,7 @@ async def feishu_callback(request: Request, code: str | None = None, state: str 
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     request.session["user_id"] = str(user["id"])
-    return RedirectResponse(f"{settings.web_origin.rstrip('/')}/", status_code=302)
+    return RedirectResponse(f"{settings.web_origin.rstrip('/')}{safe_return_path(state_data.get('return_path'))}", status_code=302)
 
 
 @router.get("/me")
@@ -75,4 +90,8 @@ async def current_user(request: Request) -> dict[str, object]:
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"id": user_id}
+    from app.services.user_repository import current_user_profile
+    try:
+        return await current_user_profile(str(user_id))
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
