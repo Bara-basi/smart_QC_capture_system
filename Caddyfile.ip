@@ -1,5 +1,8 @@
 {
     email {$ACME_EMAIL}
+    # Clients commonly omit TLS SNI when connecting to an IP literal. Without
+    # a default, Caddy cannot select the IP certificate during the handshake.
+    default_sni {$APP_IP}
 }
 
 # Public-IP deployment. The certificate is issued and renewed by Certbot on

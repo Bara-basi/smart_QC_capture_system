@@ -125,6 +125,15 @@ FastAPI。浏览器访问的仍是 `/api/v1/...`，因此会话 Cookie、JSAPI �
 - 云安全组和系统防火墙仅放行 TCP `80`、`443` 与管理用 SSH；不要暴露 `8000`、PostgreSQL 或 Redis。
 - 将仓库复制到服务器，例如 `/opt/smart-qc-capture-system`。生产数据库 Docker volume 应纳入备份策略。
 
+以 Ubuntu/Debian 为例，安装 Docker Engine 和 Compose v2 后，先确认服务可用：
+
+```bash
+sudo systemctl enable --now docker
+docker --version
+docker compose version
+sudo usermod -aG docker "$USER" # 重新登录后可免 sudo 使用 docker
+```
+
 Caddy 会在域名正确解析、80/443 可访问后自动申请和续期 Let's Encrypt 证书。若服务器已有 Nginx/Apache 占用 80 或 443，应停用它，或改由现有反代转发至 Caddy。
 
 ### 无域名（公网 IP）模式
@@ -173,6 +182,18 @@ OSS_ACCESS_KEY_SECRET=<对应密钥>
 密码若含有 `@`、`:`、`/`、`?`、`#` 等字符，必须进行 URL 编码后再写入
 `DATABASE_URL`。`WEB_ORIGIN` 必须是用户实际打开的唯一 HTTPS 地址，且不能带末尾 `/`。
 
+如需自动抓取 ERP 订单，还在 `backend/.env` 追加：
+
+```dotenv
+ERP_BASE_URL=https://<ERP地址>/
+ERP_USERNAME=<ERP账号>
+ERP_PASSWORD=<ERP密码>
+ERP_TOKEN_FILE=/app/data/erp_session.json
+ERP_PURCHASE_SNAPSHOT_FILE=/app/data/erp_purchase_snapshot.json
+```
+
+`./data` 会挂载到容器内的 `/app/data`，用于持久保存 ERP 登录 Cookie 和抓取快照；该目录已被 Git 忽略。若不希望在配置文件保存 ERP 密码，可不设置 `ERP_PASSWORD`，在登录 Cookie 失效时手动刷新。
+
 ### 3. 配置飞书网页应用
 
 将以下值配置到同一个自建应用并发布生效：
@@ -207,6 +228,37 @@ done
 
 ```bash
 docker compose --env-file .env.production -f docker-compose.production.yml logs -f caddy api
+```
+
+## 启动 ERP 订单抓取定时任务
+
+ERP 抓取脚本会把新合同和产品任务写入飞书多维表格，并更新已有任务的 `质检阶段`；飞书自动化随后调用 Webhook 将数据导入本系统。因此飞书自动化和此定时任务应同时启用。
+
+首次部署时，在 API 容器人工验证（均在仓库根目录运行）：
+
+```bash
+# 仅抓取 2 条并保存快照，不写飞书
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  exec -T api python scripts/sync_erp_purchases.py --dry-run --limit 2
+
+# 首次正式同步；必要时创建飞书可写的“采购时间”字段
+docker compose --env-file .env.production -f docker-compose.production.yml \
+  exec -T api python scripts/sync_erp_purchases.py --ensure-schema
+```
+
+确认没有 `ERROR:` 后，使用宿主机 cron 每 15 分钟运行一次。`flock` 防止上一次抓取未结束时并发执行，日志放在不会提交 Git 的 `data/`：
+
+```bash
+crontab -e
+*/15 * * * * flock -n /tmp/smart-qc-erp-sync.lock sh -lc 'cd /opt/smart-qc-capture-system && docker compose --env-file .env.production -f docker-compose.production.yml exec -T api python scripts/sync_erp_purchases.py >> data/erp-sync.log 2>&1'
+```
+
+API 容器重启或更新后不需要重设 cron。查看任务结果：
+
+```bash
+tail -n 100 data/erp-sync.log
+docker compose --env-file .env.production -f docker-compose.production.yml exec -T api \
+  sh -c 'ls -l /app/data/erp_session.json /app/data/erp_purchase_snapshot.json'
 ```
 
 ## 无域名部署：公网 IP + HTTPS
@@ -252,12 +304,23 @@ Let’s Encrypt 从 2026 年起正式支持公网 IP 证书，但 IP 证书仅�
    ```
 
 5. 设置宿主机每日续期。首次证书完成后，Caddy 会通过 `certbot-webroot/` 提供 ACME
-   校验文件，因此续期不需要停服务：
+   校验文件。先把首次申请时的 `standalone` 验证方式改为 `webroot`；否则 Caddy
+   占用 80 端口后，`certbot renew` 会失败：
+
+   ```bash
+   sudo certbot reconfigure --webroot \
+     --webroot-path /opt/smart-qc-capture-system/certbot-webroot \
+     --preferred-profile shortlived --ip-address <APP_IP> \
+     --deploy-hook 'cd /opt/smart-qc-capture-system && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
+   sudo certbot renew --dry-run
+   ```
+
+   然后设置每日续期；证书更新后 Caddy 会自动重载，过程中无需停服务：
 
    ```bash
    sudo crontab -e
-   # 每天 03:15 尝试续期；证书更新后让 Caddy 重新加载
-   15 3 * * * certbot renew --quiet --deploy-hook 'cd /opt/smart-qc-capture-system && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
+   # 每天 03:15 尝试续期；deploy-hook 已由 certbot reconfigure 持久保存
+   15 3 * * * certbot renew --quiet
    ```
 
 飞书后台改为配置：H5 首页 `https://<APP_IP>/`，OAuth 回调

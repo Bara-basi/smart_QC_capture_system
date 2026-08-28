@@ -22,6 +22,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      # Persist ERP login cookies and crawl snapshots across container updates.
+      - ./data:/app/data
     expose:
       - "8000"
 
