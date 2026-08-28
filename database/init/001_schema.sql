@@ -43,7 +43,6 @@ CREATE TABLE order_items (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
     contract_no VARCHAR(100) NOT NULL,
-    contract_sequence_no TEXT,
     product_type VARCHAR(100) NOT NULL,
     inspection_status VARCHAR(100),
     inspector_open_id VARCHAR(128),

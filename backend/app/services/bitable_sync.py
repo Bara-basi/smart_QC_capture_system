@@ -83,11 +83,6 @@ def _product_type(fields: dict[str, Any]) -> str | None:
     return _text(_find(fields, "产品类型", "产品类别", "product_type", "product type"))
 
 
-def _contract_sequence_no(fields: dict[str, Any]) -> str | None:
-    """Read the serial number from the Bitable contract record."""
-    return _text(_find(fields, "序号", "合同序号", "sequence_no", "sequence"))
-
-
 async def _upsert_order_item(connection: asyncpg.Connection, client: FeishuBitableClient, record: dict[str, Any]) -> tuple[str, str]:
     fields = record.get("fields") or {}
     record_id = record.get("record_id")
@@ -109,16 +104,16 @@ async def _upsert_order_item(connection: asyncpg.Connection, client: FeishuBitab
     )
     await connection.execute(
         """INSERT INTO order_items
-           (order_id, contract_no, contract_sequence_no, product_type, feishu_record_id, feishu_fields,
+           (order_id, contract_no, product_type, feishu_record_id, feishu_fields,
             inspection_status, inspector_open_id, inspector_union_id, inspector_name)
-           SELECT id, $1::varchar, $3::text, $4::varchar, $2::varchar, $5::jsonb, $6::varchar, $7::varchar, $8::varchar, $9::varchar
+           SELECT id, $1::varchar, $3::varchar, $2::varchar, $4::jsonb, $5::varchar, $6::varchar, $7::varchar, $8::varchar
            FROM orders WHERE contract_no = $1::varchar
            ON CONFLICT (feishu_record_id) DO UPDATE SET
-             contract_no = EXCLUDED.contract_no, contract_sequence_no = EXCLUDED.contract_sequence_no, product_type = EXCLUDED.product_type,
+             contract_no = EXCLUDED.contract_no, product_type = EXCLUDED.product_type,
              feishu_fields = EXCLUDED.feishu_fields, inspection_status = EXCLUDED.inspection_status, inspector_open_id = EXCLUDED.inspector_open_id,
              inspector_union_id = EXCLUDED.inspector_union_id, inspector_name = EXCLUDED.inspector_name,
              updated_at = NOW()""",
-        contract_no, record_id, _contract_sequence_no(fields), product_type, json.dumps(fields, ensure_ascii=False), inspection_status, inspector_open_id, inspector_union_id, inspector_name,
+        contract_no, record_id, product_type, json.dumps(fields, ensure_ascii=False), inspection_status, inspector_open_id, inspector_union_id, inspector_name,
     )
     return contract_no, product_type
 

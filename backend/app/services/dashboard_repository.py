@@ -133,10 +133,6 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             raise LookupError("Task not found")
         tasks = await connection.fetch(
             """SELECT t.feishu_record_id, t.product_type, t.specification, t.inspection_stage, t.sequence_no,
-                      COALESCE((SELECT oi.contract_sequence_no
-                                FROM order_items oi
-                                WHERE oi.contract_no = t.contract_no AND oi.product_type = t.product_type
-                                ORDER BY oi.updated_at DESC LIMIT 1), t.sequence_no) AS contract_sequence_no,
                       EXISTS(SELECT 1 FROM photo_records p WHERE p.task_feishu_record_id = t.feishu_record_id) AS uploaded
                FROM inspection_photo_tasks t WHERE t.contract_no = $1 AND t.inspector_open_id = $2
                ORDER BY sequence_no NULLS LAST, created_at""",
@@ -154,7 +150,7 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             "contract_no": selected["contract_no"],
             "tasks": [
                 {"feishu_record_id": task["feishu_record_id"], "product_type": task["product_type"],
-                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "contract_sequence_no": task["contract_sequence_no"], "uploaded": {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
+                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "uploaded": {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
                  "requirements": [{"name": name, "mandatory": name in _mandatory_items()} for name in _requirements(task["product_type"])], "photos": by_task[str(task["feishu_record_id"])]}
                 for task in tasks
             ],
