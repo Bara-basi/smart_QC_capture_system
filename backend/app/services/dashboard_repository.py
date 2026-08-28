@@ -52,6 +52,22 @@ def _is_complete(status: str | None) -> bool:
     return (status or "").strip().lower() in {item.lower() for item in DONE_STATUSES}
 
 
+def _product_previews(tasks: list[Any], limit: int = 3) -> list[str]:
+    """Build the compact, distinct specification preview for an order card."""
+    previews: list[str] = []
+    seen_specifications: set[str] = set()
+    for task in tasks:
+        specification = str(task["specification"] or "").strip()
+        # Treat visually identical specifications with incidental whitespace as
+        # one item, while retaining the first source value for display.
+        key = " ".join(specification.split()).casefold()
+        if key in seen_specifications:
+            continue
+        seen_specifications.add(key)
+        previews.append(f"{specification or '未填写规格'} · {str(task['product_type'] or '未分类').strip() or '未分类'}")
+    return previews[:limit] + (["等"] if len(previews) > limit else [])
+
+
 async def inspector_dashboard(user_id: str) -> dict[str, Any]:
     connection = await asyncpg.connect(_dsn())
     try:
@@ -92,7 +108,7 @@ async def inspector_dashboard(user_id: str) -> dict[str, Any]:
                     "task_count": len(tasks),
                     "pending_count": len(pending),
                     "status": "completed" if not pending else "pending",
-                    "products": [f"{task['specification'] or '未填写规格'} · {task['product_type'] or '未分类'}" for task in tasks],
+                    "products": _product_previews(tasks),
                     "task_ids": [task["feishu_record_id"] for task in tasks],
                 }
             )
@@ -117,6 +133,10 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             raise LookupError("Task not found")
         tasks = await connection.fetch(
             """SELECT t.feishu_record_id, t.product_type, t.specification, t.inspection_stage, t.sequence_no,
+                      COALESCE((SELECT oi.contract_sequence_no
+                                FROM order_items oi
+                                WHERE oi.contract_no = t.contract_no AND oi.product_type = t.product_type
+                                ORDER BY oi.updated_at DESC LIMIT 1), t.sequence_no) AS contract_sequence_no,
                       EXISTS(SELECT 1 FROM photo_records p WHERE p.task_feishu_record_id = t.feishu_record_id) AS uploaded
                FROM inspection_photo_tasks t WHERE t.contract_no = $1 AND t.inspector_open_id = $2
                ORDER BY sequence_no NULLS LAST, created_at""",
@@ -134,7 +154,7 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             "contract_no": selected["contract_no"],
             "tasks": [
                 {"feishu_record_id": task["feishu_record_id"], "product_type": task["product_type"],
-                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "uploaded": {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
+                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "contract_sequence_no": task["contract_sequence_no"], "uploaded": {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
                  "requirements": [{"name": name, "mandatory": name in _mandatory_items()} for name in _requirements(task["product_type"])], "photos": by_task[str(task["feishu_record_id"])]}
                 for task in tasks
             ],

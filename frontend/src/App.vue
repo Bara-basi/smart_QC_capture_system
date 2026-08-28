@@ -6,7 +6,7 @@ import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveD
 type Order = { contract_no: string; started_at: string; task_count: number; pending_count: number; status: string; products: string[]; task_ids: string[] }
 type Requirement = { name: string; mandatory: boolean }
 type SavedPhoto = { id: string; inspection_item: string; name: string }
-type ProductTask = { feishu_record_id: string; product_type: string; specification: string; inspection_stage: string; sequence_no: string | null; uploaded: boolean; requirements: Requirement[]; photos: SavedPhoto[] }
+type ProductTask = { feishu_record_id: string; product_type: string; specification: string; inspection_stage: string; sequence_no: string | null; contract_sequence_no: string | null; uploaded: boolean; requirements: Requirement[]; photos: SavedPhoto[] }
 type CaptureTask = { contract_no: string; tasks: ProductTask[] }
 type Dashboard = { user: { name: string }; pending_task_count: number; orders: Order[] }
 type Photo = { name: string; tone: string; url: string; draftId?: string; recordId?: string }
@@ -598,8 +598,8 @@ onMounted(async () => {
           <header class="topbar capture-topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
-          <div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.specification || task.product_type || `任务 ${index + 1}` }}</span></button></div>
-          <p class="hint">带 <em>*</em> 的项目为必拍项；左右滑动可切换规格任务。</p>
+          <div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.contract_sequence_no || `任务 ${index + 1}` }}</span></button></div>
+          <p class="hint">带 <em>*</em> 的项目为必拍项；左右滑动可切换合同序号任务。</p>
           <p v-if="cameraError" class="camera-error">{{ cameraError }}</p>
           <p v-if="submitError" class="camera-error">{{ submitError }}</p>
           <div class="task-swipe" @touchstart.passive="onSwipeStart" @touchend.passive="onSwipeEnd">
