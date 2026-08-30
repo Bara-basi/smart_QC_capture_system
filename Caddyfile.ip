@@ -50,5 +50,7 @@ http://{$APP_IP} {
         root * /var/www/certbot
         file_server
     }
-    redir https://{$APP_IP}{uri} permanent
+    handle {
+        redir https://{$APP_IP}{uri} permanent
+    }
 }

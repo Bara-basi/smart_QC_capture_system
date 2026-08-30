@@ -138,20 +138,11 @@ Caddy 会在域名正确解析、80/443 可访问后自动申请和续期 Let's 
 
 ### 无域名（公网 IP）模式
 
-若服务器在香港或境外，可使用公网 IP，例如 `http://203.0.113.10`，不需要购买域名。
-将 `.env.production` 的 `APP_ORIGIN` 设为该完整地址，并将 `backend/.env` 的
-`WEB_ORIGIN` 设为完全相同的值；Caddy 会以 HTTP 提供服务，不会申请 TLS 证书。
-飞书网页应用首页、可信来源/安全设置和 OAuth 回调地址都必须改为：
-
-```text
-http://203.0.113.10/
-http://203.0.113.10/api/v1/auth/feishu/callback
-```
-
-该模式降低了传输保护等级，建议仅用于企业内部飞书用户和非敏感网络；登录 Cookie
-仍为 HTTP-only，但不会带 Secure 属性。飞书控制台若拒绝 IP 作为网页应用主页或回调
-地址，则该飞书租户只能使用 HTTPS 域名，不能通过代码规避。中国大陆服务器即使仅
-通过 IP 提供网站，通常也需要办理 IP 地址备案；请向服务器接入商确认。
+可使用固定公网 IP，例如 `https://203.0.113.10`，不需要购买域名。当前 IP 部署
+配置使用由宿主机 Certbot 管理的公网 IP HTTPS 证书；请按下文“IP 模式配置”完成
+证书申请、Compose 启动及续期。不要把 `APP_ORIGIN` 或 `WEB_ORIGIN` 配置成 HTTP，
+也不要混用 `.env.production` 与 IP 模式的 `.env.ip`。中国大陆服务器即使仅通过 IP
+提供网站，通常也需要办理 IP 地址备案；请向服务器接入商确认。
 
 ### 2. 填写配置
 
@@ -308,10 +299,10 @@ Let’s Encrypt 从 2026 年起正式支持公网 IP 证书，但 IP 证书仅�
    占用 80 端口后，`certbot renew` 会失败：
 
    ```bash
-   sudo certbot reconfigure --webroot \
-     --webroot-path /opt/smart-qc-capture-system/certbot-webroot \
+   sudo certbot reconfigure --cert-name <APP_IP> --webroot \
+     --webroot-path /opt/<项目目录>/certbot-webroot \
      --preferred-profile shortlived --ip-address <APP_IP> \
-     --deploy-hook 'cd /opt/smart-qc-capture-system && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
+     --deploy-hook 'cd /opt/<项目目录> && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
    sudo certbot renew --dry-run
    ```
 
