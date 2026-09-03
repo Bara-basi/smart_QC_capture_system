@@ -1,4 +1,13 @@
-from scripts.sync_erp_purchases import ProductTask, PurchaseOrder, _task_write_plan
+import pytest
+
+from scripts.sync_erp_purchases import (
+    ProductTask,
+    PurchaseOrder,
+    _factory_backfill_plan,
+    _order_create_records,
+    _task_write_plan,
+    factory_name,
+)
 
 
 def _order(stage: str = "待检") -> PurchaseOrder:
@@ -81,3 +90,45 @@ def test_non_numeric_erp_sequence_is_preserved() -> None:
     creates, _ = _task_write_plan([], [alphanumeric_order], {})
 
     assert creates[0]["fields"]["序号"] == "A1"
+
+
+@pytest.mark.parametrize(
+    ("contract_no", "expected"),
+    [
+        ("26MT-10B396", None),
+        ("26MT-06N398-ABCD", None),
+        ("26MT-06M347-ADD1", None),
+        ("26MT-06M362Y-2-HD", "鸿迪"),
+        ("26MT-06M362Y-1 沪新", "沪新"),
+        ("26MT-06H056ADD1-HD", "鸿迪"),
+        ("26MT-06H344溪流供应链-秦皇岛", "秦皇岛"),
+        ("26MT-05J298-溪流-诚吉", "诚吉"),
+        ("26MT-03P238溪流GYL-兴耀城", "兴耀城"),
+        ("26MT-08C020 麦金3吨", "麦金"),
+        ("26MT-06C405ADD1-中凯", "中凯"),
+        ("SP-07E004-鸿迪", "鸿迪"),
+        ("26MT-10E285-XL", None),
+    ],
+)
+def test_factory_name_is_conservative(contract_no: str, expected: str | None) -> None:
+    assert factory_name(contract_no) == expected
+
+
+def test_factory_backfill_only_fills_empty_cells() -> None:
+    records = [
+        {"record_id": "rec-1", "fields": {"合同号": "26MT-03R411-HD", "工厂": ""}},
+        {"record_id": "rec-2", "fields": {"合同号": "26MT-03R411-HD", "工厂": "人工修正"}},
+        {"record_id": "rec-3", "fields": {"合同号": "26MT-10E285-XL"}},
+    ]
+
+    assert _factory_backfill_plan(records) == [{"record_id": "rec-1", "fields": {"工厂": "鸿迪"}}]
+
+
+def test_new_order_includes_factory_only_when_mapping_is_confident() -> None:
+    mapped = PurchaseOrder(**{**_order().__dict__, "purchase_code": "26MT-03R411-HD"})
+    unknown = PurchaseOrder(**{**_order().__dict__, "purchase_code": "26MT-10E285-XL"})
+
+    records = _order_create_records([mapped, unknown], "采购时间")
+
+    assert records[0]["fields"]["工厂"] == "鸿迪"
+    assert "工厂" not in records[1]["fields"]

@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -64,8 +65,15 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_SNAPSHOT_FILE = (
     Path(__file__).resolve().parents[1] / "data" / "erp_purchase_snapshot.json"
 )
+FACTORY_MAPPING_FILE = (
+    Path(__file__).resolve().parents[2] / "data" / "factroy_mapping.json"
+)
+ORDER_CODE_PATTERN = re.compile(
+    r"^(?:\d{2}MT|SP)-?(?:\d{2}[A-Z]\d{3}Y?|DP\d{3})",
+    re.IGNORECASE,
+)
 
-ORDER_FIELDS = {"合同号", "产品类型", "质检状态"}
+ORDER_FIELDS = {"合同号", "产品类型", "质检状态", "工厂"}
 TASK_FIELDS = {"合同号", "序号", "产品类型", "规格", "数量", "质检阶段"}
 
 
@@ -139,6 +147,55 @@ def _normalize_number(value: str) -> str:
         return value
     normalized = format(number.normalize(), "f")
     return "0" if normalized in {"-0", ""} else normalized
+
+
+def _normalize_factory_token(value: str) -> str:
+    return re.sub(r"[\s_-]+", "", value).upper()
+
+
+@lru_cache(maxsize=1)
+def _factory_aliases() -> tuple[tuple[str, str], ...]:
+    try:
+        payload = json.loads(FACTORY_MAPPING_FILE.read_text(encoding="utf-8"))
+        aliases = payload["aliases"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(
+            f"Invalid factory mapping file: {FACTORY_MAPPING_FILE}"
+        ) from exc
+    if not isinstance(aliases, dict):
+        raise ValueError(  # noqa: TRY004 - malformed user-maintained configuration
+            f"Factory mapping aliases must be an object: {FACTORY_MAPPING_FILE}"
+        )
+    normalized: list[tuple[str, str]] = []
+    for alias, factory in aliases.items():
+        if not isinstance(alias, str) or not isinstance(factory, str):
+            raise ValueError(  # noqa: TRY004 - malformed user-maintained configuration
+                "Factory mapping aliases and values must be strings"
+            )
+        token = _normalize_factory_token(alias)
+        name = factory.strip()
+        if token and name:
+            normalized.append((token, name))
+    return tuple(normalized)
+
+
+def factory_name(contract_no: str) -> str | None:
+    """Return only an explicitly mapped factory found after the order-code core."""
+    compact = re.sub(r"\s+", "", contract_no or "")
+    match = ORDER_CODE_PATTERN.match(compact)
+    if not match:
+        return None
+    suffix = _normalize_factory_token(compact[match.end() :])
+    if not suffix:
+        return None
+    candidates: list[tuple[int, int, str]] = []
+    for alias, factory in _factory_aliases():
+        position = suffix.rfind(alias)
+        if position >= 0:
+            candidates.append((position, len(alias), factory))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1]))[2]
 
 
 def parse_purchase_list(payload: dict[str, Any]) -> tuple[list[PurchaseSummary], int]:
@@ -566,6 +623,9 @@ class FeishuPurchaseSyncClient:
             if (contract := _field_text((record.get("fields") or {}).get("合同号")))
         }
 
+    def existing_orders(self) -> list[dict[str, Any]]:
+        return self.iter_records(settings.feishu_bitable_order_table_id)
+
     def existing_tasks(self) -> list[dict[str, Any]]:
         return self.iter_records(settings.feishu_bitable_table_id)
 
@@ -731,6 +791,38 @@ def _task_write_plan(
     return create_records, update_records
 
 
+def _factory_backfill_plan(
+    existing_records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Fill empty factory cells only; never overwrite an administrator's value."""
+    updates: list[dict[str, Any]] = []
+    for record in existing_records:
+        fields = record.get("fields") or {}
+        if _field_text(fields.get("工厂")):
+            continue
+        record_id = _field_text(record.get("record_id"))
+        factory = factory_name(_field_text(fields.get("合同号")))
+        if record_id and factory:
+            updates.append({"record_id": record_id, "fields": {"工厂": factory}})
+    return updates
+
+
+def _order_create_records(orders: list[PurchaseOrder], purchase_date_field: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for order in orders:
+        fields: dict[str, Any] = {
+            "合同号": order.purchase_code,
+            purchase_date_field: _purchase_date_timestamp(order.purchase_date),
+            "产品类型": order.product_types,
+            "质检状态": "待分配",
+        }
+        factory = factory_name(order.purchase_code)
+        if factory:
+            fields["工厂"] = factory
+        records.append({"fields": fields})
+    return records
+
+
 def _bitable_sequence(sequence: str) -> float | str:
     """Keep alphanumeric ERP sequences instead of aborting the whole sync."""
     try:
@@ -769,17 +861,7 @@ def sync_to_feishu(
         if orders
         else "采购时间"
     )
-    order_records = [
-        {
-            "fields": {
-                "合同号": order.purchase_code,
-                purchase_date_field: _purchase_date_timestamp(order.purchase_date),
-                "产品类型": order.product_types,
-                "质检状态": "待分配",
-            }
-        }
-        for order in orders
-    ]
+    order_records = _order_create_records(orders, purchase_date_field)
     created_orders = feishu.batch_create(
         settings.feishu_bitable_order_table_id,
         order_records,
@@ -822,6 +904,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Create the writable Feishu 采购时间 DateTime field if missing.",
     )
+    parser.add_argument(
+        "--backfill-factories-only",
+        action="store_true",
+        help="Fill empty 工厂 cells in the Feishu order table, then exit without reading ERP.",
+    )
     return parser
 
 
@@ -842,6 +929,21 @@ def main() -> int:
     feishu: FeishuPurchaseSyncClient | None = None
     try:
         feishu = FeishuPurchaseSyncClient(timeout=args.timeout)
+        if args.backfill_factories_only:
+            feishu.validate_fields()
+            order_records = feishu.existing_orders()
+            factory_updates = _factory_backfill_plan(order_records)
+            updated = feishu.batch_update(
+                settings.feishu_bitable_order_table_id,
+                factory_updates,
+                label="order factories",
+            )
+            print(
+                f"Factory backfill complete: scanned_orders={len(order_records)}, "
+                f"updated_factories={updated}, skipped={len(order_records) - updated}, "
+                f"Feishu requests={feishu.request_count}"
+            )
+            return 0
         existing_contracts = feishu.existing_contracts()
         erp = ErpPurchaseClient(
             base_url=args.base_url,

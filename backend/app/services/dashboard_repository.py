@@ -20,6 +20,7 @@ from app.services.feishu_status_sync import enqueue_status_updates
 RULES_PATH = Path(__file__).resolve().parents[2] / "data" / "require_mapping.json"
 DONE_STATUSES = {"已完成", "已提交", "completed", "submitted"}
 CAPTURE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+SUPPLEMENTAL_REQUIREMENT = "补充拍照"
 
 
 @dataclass(frozen=True)
@@ -40,7 +41,23 @@ def _requirement_rules() -> tuple[dict[str, list[str]], set[str]]:
 
 def _requirements(product_type: str | None) -> list[str]:
     products, _ = _requirement_rules()
-    return products.get(product_type or "", products["其它"])
+    requirements = list(products.get(product_type or "", products["其它"]))
+    if SUPPLEMENTAL_REQUIREMENT not in requirements:
+        requirements.append(SUPPLEMENTAL_REQUIREMENT)
+    return requirements
+
+
+def _sequence_sort_key(value: Any) -> tuple[Any, ...]:
+    """Sort human sequence numbers naturally: 1, 2, 10, A1, A2, A10."""
+    text = str(value or "").strip()
+    if not text:
+        return (1,)
+    parts = tuple(
+        (0, int(part)) if part.isdigit() else (1, part.casefold())
+        for part in re.split(r"(\d+)", text)
+        if part
+    )
+    return (0, *parts)
 
 
 def _mandatory_items() -> set[str]:
@@ -131,21 +148,23 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
         )
         if not selected:
             raise LookupError("Task not found")
-        tasks = await connection.fetch(
+        tasks = list(await connection.fetch(
             """SELECT t.feishu_record_id, t.product_type, t.specification, t.inspection_stage, t.sequence_no,
                       EXISTS(SELECT 1 FROM photo_records p WHERE p.task_feishu_record_id = t.feishu_record_id) AS uploaded
                FROM inspection_photo_tasks t WHERE t.contract_no = $1 AND t.inspector_open_id = $2
-               ORDER BY sequence_no NULLS LAST, created_at""",
+               ORDER BY created_at""",
             selected["contract_no"], user["open_id"],
-        )
+        ))
+        tasks.sort(key=lambda task: _sequence_sort_key(task["sequence_no"]))
         photos = await connection.fetch(
-            """SELECT id, task_feishu_record_id, inspection_item, original_filename
+            """SELECT id, task_feishu_record_id, inspection_item, original_filename,
+                      COALESCE(metadata->>'inspection_note', '') AS inspection_note
                FROM photo_records WHERE contract_no = $1 AND photographer_open_id = $2 ORDER BY captured_at""",
             selected["contract_no"], user["open_id"],
         )
         by_task: dict[str, list[dict[str, str]]] = defaultdict(list)
         for photo in photos:
-            by_task[str(photo["task_feishu_record_id"])].append({"id": str(photo["id"]), "inspection_item": str(photo["inspection_item"]), "name": str(photo["original_filename"] or "现场照片.jpg")})
+            by_task[str(photo["task_feishu_record_id"])].append({"id": str(photo["id"]), "inspection_item": str(photo["inspection_item"]), "name": str(photo["original_filename"] or "现场照片.jpg"), "inspection_note": str(photo["inspection_note"] or "")})
         return {
             "contract_no": selected["contract_no"],
             "tasks": [
@@ -434,7 +453,8 @@ async def inspector_photos(
     try:
         rows = await connection.fetch(
             f"""SELECT p.id, p.original_filename, p.contract_no, p.product_type, p.specification,
-                       p.inspection_item, p.captured_at, p.photographer_name
+                       p.inspection_item, p.captured_at, p.photographer_name,
+                       COALESCE(p.metadata->>'inspection_note', '') AS inspection_note
                 FROM photo_records p JOIN users u ON u.id = $1::uuid
                 WHERE {' AND '.join(clauses)}
                 ORDER BY p.captured_at {'ASC' if sort == 'asc' else 'DESC'}, p.id DESC
@@ -451,6 +471,7 @@ async def inspector_photos(
                 "inspection_item": str(row["inspection_item"] or ""),
                 "captured_at": row["captured_at"].isoformat(),
                 "photographer_name": str(row["photographer_name"] or ""),
+                "inspection_note": str(row["inspection_note"] or ""),
             }
             for row in rows
         ]

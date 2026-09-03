@@ -93,7 +93,7 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
             "oss_object_key": object_key, "preview_oss_object_key": preview_key, "original_filename": file.filename,
             "content_type": content_type, "file_size_bytes": len(watermarked), "sha256": hashlib.sha256(watermarked).hexdigest(),
             "watermarked": watermarked, "preview": preview,
-            "metadata": {"source": "feishu_h5_camera", "watermarked": True, "preview_bucket": settings.oss_preview_bucket, "client_captured_at": item["client_captured_at"]},
+            "metadata": {"source": "feishu_h5_camera", "watermarked": True, "preview_bucket": settings.oss_preview_bucket, "client_captured_at": item["client_captured_at"], "inspection_note": item.get("inspection_note", "")},
             "search_text": " ".join(str(value) for value in (task["contract_no"], factory or "", task["sequence_no"] or "", task["product_type"] or "", task["specification"] or "", item["inspection_item"], task["name"] or "") if value),
         })
 
@@ -171,6 +171,10 @@ def _manifest(value: str, file_count: int) -> dict[str, object]:
             raise HTTPException(status_code=400, detail="Invalid photo manifest item")
         if not item["inspection_item"].strip() or item["file_index"] < 0 or item["file_index"] >= file_count:
             raise HTTPException(status_code=400, detail="Invalid photo manifest item")
+        note = item.get("inspection_note", "")
+        if not isinstance(note, str) or len(note.strip()) > 500:
+            raise HTTPException(status_code=400, detail="Photo note must be at most 500 characters")
+        item["inspection_note"] = note.strip()
         indexes.add(item["file_index"])
     if indexes != set(range(file_count)):
         raise HTTPException(status_code=400, detail="Invalid file indexes")

@@ -5,12 +5,12 @@ import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveD
 
 type Order = { contract_no: string; started_at: string; task_count: number; pending_count: number; status: string; products: string[]; task_ids: string[] }
 type Requirement = { name: string; mandatory: boolean }
-type SavedPhoto = { id: string; inspection_item: string; name: string }
+type SavedPhoto = { id: string; inspection_item: string; name: string; inspection_note?: string }
 type ProductTask = { feishu_record_id: string; product_type: string; specification: string; inspection_stage: string; sequence_no: string | null; uploaded: boolean; requirements: Requirement[]; photos: SavedPhoto[] }
 type CaptureTask = { contract_no: string; tasks: ProductTask[] }
 type Dashboard = { user: { name: string }; pending_task_count: number; orders: Order[] }
 type Photo = { name: string; tone: string; url: string; draftId?: string; recordId?: string }
-type GalleryPhoto = { id: string; name: string; contract_no: string; product_type: string; specification: string; inspection_item: string; captured_at: string; photographer_name: string }
+type GalleryPhoto = { id: string; name: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string }
 type GalleryResponse = { photos: GalleryPhoto[]; count: number }
 type FeishuChooseImageResult = { tempFilePaths?: string[]; localIds?: string[] }
 type FileSystemManager = { readFile: (options: { filePath: string; encoding?: 'base64'; success: (result: { data: string | ArrayBuffer }) => void; fail: (error: unknown) => void }) => void }
@@ -38,6 +38,7 @@ const submitStatus = ref<'idle' | 'uploading' | 'success' | 'error'>('idle')
 const touchStartX = ref(0)
 const taskTabs = ref<HTMLElement | null>(null)
 const editingTaskIds = ref<Set<string>>(new Set())
+const supplementalNotes = ref<Record<string, string>>({})
 const galleryPhotos = ref<GalleryPhoto[]>([])
 const galleryLoading = ref(false)
 const galleryError = ref('')
@@ -72,6 +73,7 @@ let jsapiReady: Promise<void> | null = null
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000
 const UPLOAD_REQUEST_TIMEOUT_MS = 180_000
 const MAX_UPLOAD_DIMENSION = 1920
+const SUPPLEMENTAL_REQUIREMENT = '补充拍照'
 
 const surname = computed(() => dashboard.value?.user.name?.slice(0, 1) || '质')
 const greeting = computed(() => {
@@ -373,6 +375,7 @@ async function openGallery() {
 async function openTask(recordId: string) {
   activeTask.value = await request<CaptureTask>(`/api/v1/dashboard/tasks/${recordId}`)
   photos.value = {}
+  supplementalNotes.value = {}
   uploadedTaskIds.value = new Set(activeTask.value.tasks.filter(task => task.uploaded).map(task => task.feishu_record_id))
   restoreSavedPhotos()
   openSubtask.value = 0
@@ -414,7 +417,7 @@ async function addPhoto(taskId: string, requirement: string) {
     if (!task || !activeTask.value) throw new Error('拍照任务已失效，请返回后重新进入')
     const image = await optimizePhotoForUpload(await readTemporaryPhoto(localPath))
     const capturedAt = new Date().toISOString()
-    const draft: PhotoDraft = { id: crypto.randomUUID(), contractNo: activeTask.value.contract_no, taskId, inspectionItem: requirement, capturedAt, image, createdAt: Date.now() }
+    const draft: PhotoDraft = { id: crypto.randomUUID(), contractNo: activeTask.value.contract_no, taskId, inspectionItem: requirement, inspectionNote: requirement === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', capturedAt, image, createdAt: Date.now() }
     await saveDraft(draft)
     const imageUrl = draftPreview(draft)
     const list = photos.value[photoKey(taskId, requirement)] ||= []
@@ -507,6 +510,7 @@ function restoreSavedPhotos() {
     for (const saved of task.photos) {
       const list = photos.value[photoKey(task.feishu_record_id, saved.inspection_item)] ||= []
       list.push({ name: saved.name, tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: `/api/v1/feishu/photos/${saved.id}/preview`, recordId: saved.id })
+      if (saved.inspection_item === SUPPLEMENTAL_REQUIREMENT && saved.inspection_note && !supplementalNotes.value[task.feishu_record_id]) supplementalNotes.value[task.feishu_record_id] = saved.inspection_note
     }
   }
 }
@@ -522,7 +526,15 @@ async function restoreDrafts() {
     if (!task) continue
     const list = photos.value[photoKey(draft.taskId, draft.inspectionItem)] ||= []
     list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, draft.inspectionItem), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: draftPreview(draft), draftId: draft.id })
+    if (draft.inspectionItem === SUPPLEMENTAL_REQUIREMENT && draft.inspectionNote && !supplementalNotes.value[draft.taskId]) supplementalNotes.value[draft.taskId] = draft.inspectionNote
   }
+}
+
+async function updateSupplementalNote(taskId: string, value: string) {
+  supplementalNotes.value[taskId] = value
+  if (!activeTask.value) return
+  const drafts = (await draftsForContract(activeTask.value.contract_no)).filter(draft => draft.taskId === taskId && draft.inspectionItem === SUPPLEMENTAL_REQUIREMENT)
+  await Promise.all(drafts.map(draft => saveDraft({ ...draft, inspectionNote: value })))
 }
 
 function draftPreview(draft: PhotoDraft): string {
@@ -530,24 +542,31 @@ function draftPreview(draft: PhotoDraft): string {
 }
 
 async function submitPhotos(taskId: string) {
-  if (!activeTask.value || isSubmitting.value || uploadedTaskIds.value.has(taskId)) return
+  if (!activeTask.value || isSubmitting.value || (uploadedTaskIds.value.has(taskId) && !editingTaskIds.value.has(taskId))) return
   submitError.value = ''
   submitStatus.value = 'uploading'
   isSubmitting.value = true
   try {
     const drafts = (await draftsForContract(activeTask.value.contract_no)).filter(draft => draft.taskId === taskId)
-    if (!drafts.length) throw new Error('未找到待上传照片，请重新拍摄')
-    const form = new FormData()
-    form.append('manifest', JSON.stringify({ contract_no: activeTask.value.contract_no, photos: drafts.map((draft, index) => ({ file_index: index, task_feishu_record_id: draft.taskId, inspection_item: draft.inspectionItem, client_captured_at: draft.capturedAt })) }))
-    drafts.forEach((draft, index) => form.append('files', draft.image, `capture-${index}.jpg`))
-    const response = await fetchWithTimeout('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form }, UPLOAD_REQUEST_TIMEOUT_MS)
-    if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '提交上传失败')
-    await removeDrafts(drafts.map(draft => draft.id))
-    Object.entries(photos.value).filter(([key]) => key.startsWith(`${taskId}:`)).forEach(([, list]) => list.forEach(photo => URL.revokeObjectURL(photo.url)))
-    Object.keys(photos.value).filter(key => key.startsWith(`${taskId}:`)).forEach(key => delete photos.value[key])
-    uploadedTaskIds.value = new Set([...uploadedTaskIds.value, taskId])
+    if (!drafts.length && !editingTaskIds.value.has(taskId)) throw new Error('未找到待上传照片，请重新拍摄')
+    if (drafts.length) {
+      const form = new FormData()
+      form.append('manifest', JSON.stringify({ contract_no: activeTask.value.contract_no, photos: drafts.map((draft, index) => ({ file_index: index, task_feishu_record_id: draft.taskId, inspection_item: draft.inspectionItem, inspection_note: draft.inspectionItem === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', client_captured_at: draft.capturedAt })) }))
+      drafts.forEach((draft, index) => form.append('files', draft.image, `capture-${index}.jpg`))
+      const response = await fetchWithTimeout('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form }, UPLOAD_REQUEST_TIMEOUT_MS)
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '提交上传失败')
+      await removeDrafts(drafts.map(draft => draft.id))
+    }
+    Object.entries(photos.value).filter(([key]) => key.startsWith(`${taskId}:`)).forEach(([, list]) => list.forEach(photo => { if (photo.url.startsWith('blob:')) URL.revokeObjectURL(photo.url) }))
     editingTaskIds.value = new Set([...editingTaskIds.value].filter(id => id !== taskId))
-    await loadDashboard()
+    const refreshed = await request<CaptureTask>(`/api/v1/dashboard/tasks/${taskId}`)
+    activeTask.value = refreshed
+    photos.value = {}
+    supplementalNotes.value = {}
+    uploadedTaskIds.value = new Set(refreshed.tasks.filter(task => task.uploaded).map(task => task.feishu_record_id))
+    restoreSavedPhotos()
+    openSubtask.value = Math.max(0, refreshed.tasks.findIndex(task => task.feishu_record_id === taskId))
+    await Promise.all([restoreDrafts(), loadDashboard()])
     submitStatus.value = 'success'
     window.setTimeout(() => { if (submitStatus.value === 'success') submitStatus.value = 'idle' }, 1600)
   } catch (cause) {
@@ -598,7 +617,7 @@ onMounted(async () => {
           <header class="topbar capture-topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
-          <div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.sequence_no || `任务 ${index + 1}` }}</span></button></div>
+          <div class="task-tab-strip"><span class="task-tabs-label">合同序号</span><div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.sequence_no || `任务 ${index + 1}` }}</span></button></div></div>
           <p class="hint">带 <em>*</em> 的项目为必拍项；左右滑动可切换合同序号任务。</p>
           <p v-if="cameraError" class="camera-error">{{ cameraError }}</p>
           <p v-if="submitError" class="camera-error">{{ submitError }}</p>
@@ -609,6 +628,7 @@ onMounted(async () => {
                 <div v-for="requirement in task.requirements" :key="requirement.name" class="shot-item">
                   <div class="shot-heading"><div class="check" :class="{ checked: (photos[photoKey(task.feishu_record_id, requirement.name)] || []).length }">{{ (photos[photoKey(task.feishu_record_id, requirement.name)] || []).length ? '✓' : '' }}</div><div><b>{{ requirement.name }} <em v-if="requirement.mandatory">*</em></b><p>请确保画面清晰、可识别，并覆盖对应质检需求。</p></div></div>
                   <div class="photo-row"><div v-for="(photo, photoIndex) in photos[photoKey(task.feishu_record_id, requirement.name)] || []" :key="photo.name + photoIndex" class="photo" :class="photo.tone"><img :src="photo.url" :alt="photo.name"><button v-if="!uploadedTaskIds.has(task.feishu_record_id) || editingTaskIds.has(task.feishu_record_id)" class="remove-photo" aria-label="删除照片" @click="removePhoto(task.feishu_record_id, requirement.name, photoIndex)">×</button><span>{{ photo.name }}</span></div><button v-if="!uploadedTaskIds.has(task.feishu_record_id) || editingTaskIds.has(task.feishu_record_id)" class="add-photo" @click="addPhoto(task.feishu_record_id, requirement.name)"><i>+</i><span>拍照</span></button></div>
+                  <label v-if="requirement.name === SUPPLEMENTAL_REQUIREMENT" class="supplemental-note"><span>补充说明（选填）</span><textarea :value="supplementalNotes[task.feishu_record_id] || ''" maxlength="500" placeholder="填写客户的特殊要求、拍摄内容或其他说明" :disabled="uploadedTaskIds.has(task.feishu_record_id) && !editingTaskIds.has(task.feishu_record_id)" @input="updateSupplementalNote(task.feishu_record_id, ($event.target as HTMLTextAreaElement).value)"/></label>
                 </div>
               </div>
             </div>
@@ -644,7 +664,7 @@ onMounted(async () => {
           </div>
           <div class="result-head"><b>{{ galleryPhotos.length }} 张照片</b><div class="gallery-actions"><button class="sort-button" :title="gallerySort === 'desc' ? '当前：最近拍摄在前' : '当前：最早拍摄在前'" @click="gallerySort = gallerySort === 'desc' ? 'asc' : 'desc'; loadGallery()">{{ gallerySort === 'desc' ? '↓' : '↑' }} 时间</button><button :class="{ active: galleryView === 'grid' }" title="卡片显示" @click="galleryView = 'grid'">▦</button><button :class="{ active: galleryView === 'list' }" title="记录显示" @click="galleryView = 'list'">☷</button></div></div>
           <p v-if="galleryError" class="camera-error">{{ galleryError }}</p><p v-else-if="galleryLoading" class="empty">正在加载图片…</p><p v-else-if="!galleryPhotos.length" class="empty">没有符合当前筛选条件的已上传图片</p>
-          <div v-else class="gallery" :class="{ grid: galleryView === 'grid' }"><button v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" @click="openGalleryPhoto(photo)"><img class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button></div>
+          <div v-else class="gallery" :class="{ grid: galleryView === 'grid' }"><button v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" @click="openGalleryPhoto(photo)"><img class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button></div>
         </section>
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
           <header><button aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}</small></div><a :href="galleryPhotoUrl(selectedGalleryPhoto, 'download')" target="_blank" rel="noopener">下载</a></header>
@@ -664,7 +684,7 @@ onMounted(async () => {
 <style>
 *{box-sizing:border-box}body{margin:0;background:#e9edf3;color:#1f2329;font-family:Inter,"PingFang SC","Microsoft YaHei",sans-serif}button{font:inherit;color:inherit;cursor:pointer;border:0;background:none}.stage{min-height:100vh;display:grid;place-items:center;padding:24px}.phone{width:min(100%,430px);height:min(880px,calc(100vh - 48px));position:relative;overflow:hidden;background:#f5f7fa;border:8px solid #1e252e;border-radius:34px;box-shadow:0 24px 70px #63708466}.screen{height:100%;overflow-y:auto;padding:18px 16px 90px}.capture-screen{padding-bottom:190px}.topbar{position:sticky;top:-18px;z-index:10;height:60px;padding:18px 0 0;display:flex;align-items:center;justify-content:space-between;background:#f5f7fa}.centered-title{display:grid;grid-template-columns:31px 1fr 31px}.topbar strong{font-size:18px}.centered-title strong{text-align:center}.brand-mark{width:31px;height:31px;display:grid;place-items:center;background:#3370ff;color:#fff;border-radius:9px;font-size:12px;font-weight:800}.greeting{display:flex;align-items:center;gap:11px;margin:21px 4px 25px}.avatar{width:43px;height:43px;border-radius:14px;color:#fff;font-weight:bold;display:grid;place-items:center;background:linear-gradient(135deg,#6c8b6b,#243a43)}h1,h2,h3,p{margin:0}h1{font-size:20px;margin:3px 0}h2{font-size:17px}h3{font-size:17px;margin:8px 0 5px}.eyebrow,.muted{color:#8a919f;font-size:12px}.todo-card,.contract-card,.order-card{background:#fff;border-radius:16px;box-shadow:0 5px 18px #17233c0b}.todo-card{padding:17px}.card-heading,.list-title,.contract-top,footer,.result-head{display:flex;align-items:center;justify-content:space-between}.card-heading{font-weight:700;font-size:17px}.card-heading button,footer b{color:#3370ff;font-size:12px}.todo-row{display:flex;align-items:center;gap:10px;padding-top:18px}.todo-icon{color:#2fa56b;background:#e6f7ef;font-weight:800;width:39px;height:39px;border-radius:12px;display:grid;place-items:center;font-size:20px}.todo-row b{font-size:18px;display:block}.todo-row small{color:#8a919f;font-size:11px}.todo-sep{height:30px;width:1px;background:#e6e8eb;margin:0 8px}.go{margin-left:auto;color:#a0a7b1;font-size:25px}.list-title{margin:26px 3px 12px}.contract-card{margin-bottom:13px;padding:15px 16px}.status{background:#fff3df;color:#c27600;padding:3px 7px;border-radius:5px;font-size:11px}.status.done{background:#e3f5ea;color:#168756}.due{color:#7e8793;font-size:12px}.tag-row,.filter-chips{display:flex;gap:6px;margin:12px 0;flex-wrap:wrap}.tag-row span,.filter-chips span{padding:4px 8px;border-radius:5px;background:#f0f4fa;color:#637084;font-size:11px}.progress{height:4px;background:#edf0f3;border-radius:4px;overflow:hidden}.progress i{display:block;height:100%;background:#3370ff}.contract-card footer{margin-top:11px;font-size:11px;color:#848d99}.back{font-size:36px;line-height:20px;color:#4a5564}.order-card{margin-top:18px;padding:16px;display:flex;justify-content:space-between;align-items:center;background:linear-gradient(125deg,#fff,#eef5ff);border:1px solid #e2ebfb}.order-card h2{margin:4px 0;font-size:19px}.order-card p{font-size:12px;color:#737c88}.order-badge{text-align:right;color:#3370ff}.order-badge b,.order-badge small{display:block}.order-badge b{font-size:12px}.order-badge small{font-size:11px;color:#7c8795;margin-top:3px}.hint{font-size:12px;color:#757f8c;margin:14px 4px}.hint em,.shot-item em{font-style:normal;color:#ef6457}.capture-group{background:#fff;border-radius:13px;margin:10px 0;overflow:hidden;border:1px solid #edf0f4}.group-head{width:100%;padding:14px;display:flex;align-items:center;text-align:left;gap:9px}.component-icon{color:#3370ff;background:#edf3ff;border-radius:6px;padding:3px 5px}.group-head small{color:#9299a4;margin-left:auto;font-size:11px}.chev{width:8px;height:8px;border-right:1.5px solid #7b8491;border-bottom:1.5px solid #7b8491;transform:rotate(45deg) translateY(-2px)}.group-content{padding:0 14px 14px;border-top:1px solid #f0f2f5}.shot-item{padding:13px 0;border-bottom:1px solid #f0f2f5}.shot-item:last-child{border:0}.shot-heading{display:flex;gap:9px}.check{width:17px;height:17px;border:1.5px solid #c6ccd6;border-radius:50%;font-size:11px;display:grid;place-items:center;color:#fff;flex:none;margin-top:2px}.check.checked{background:#3370ff;border-color:#3370ff}.shot-item b{font-size:13px}.shot-item p{font-size:11px;color:#8b94a1;margin-top:4px}.photo-row{display:flex;flex-wrap:wrap;gap:8px;margin:9px 0 0 26px}.photo,.add-photo{width:74px;height:74px;border-radius:8px;overflow:hidden}.photo{position:relative;background:#73828d}.photo span{position:absolute;bottom:4px;left:4px;right:4px;color:#fff;font-size:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.remove-photo{position:absolute;right:3px;top:3px;z-index:1;width:19px;height:19px;border-radius:50%;background:#202b36cc;color:#fff;font-size:17px;line-height:17px}.add-photo{border:1px dashed #94b6fb;background:#f6f9ff;color:#3370ff;display:flex;flex-direction:column;align-items:center;justify-content:center}.add-photo i{font-size:25px;font-style:normal;line-height:22px}.add-photo span{font-size:10px;margin-top:3px}.steel-a{background:linear-gradient(135deg,#aab7bc,#3d4d55 42%,#bbc6c9 44%,#526770)}.steel-b{background:linear-gradient(35deg,#304852,#b08f6c 48%,#253941 52%)}.steel-c{background:linear-gradient(135deg,#554c47,#bda883 45%,#293f48 46%)}.capture-spacer{display:none}.bottom-action{position:absolute;bottom:68px;left:0;right:0;padding:10px 16px;background:linear-gradient(transparent,#f5f7fa 30%)}.bottom-action button{width:100%;background:#3370ff;color:#fff;font-weight:600;padding:13px;border-radius:10px;box-shadow:0 5px 11px #3370ff44}.bottom-action button:disabled{background:#aab7cf;box-shadow:none}.tabs{display:flex;gap:23px;border-bottom:1px solid #e6e9ee;margin-top:13px}.tabs button{padding:10px 4px;color:#737d89}.tabs .active{color:#3370ff;border-bottom:2px solid #3370ff;font-weight:600}.search-box{height:39px;background:#fff;border:1px solid #e6eaf0;border-radius:9px;margin:15px 0 9px;display:flex;align-items:center;padding:0 11px;gap:8px;color:#8d96a2}.placeholder{font-size:12px;flex:1}.search-box button{font-size:12px;color:#3370ff;border-left:1px solid #e8ebef;padding-left:9px}.result-head{margin:19px 0 10px}.result-head b{font-size:14px}.result-head small{font-size:11px;color:#969eaa}.gallery{display:flex;flex-direction:column;gap:8px}.gallery-item{display:flex;align-items:center;gap:10px;background:#fff;border-radius:10px;padding:8px;box-shadow:0 2px 8px #17233c08}.thumb{width:62px;height:52px;border-radius:6px;position:relative;overflow:hidden}.thumb span{position:absolute;left:5px;top:4px;color:#fff;font-weight:bold;font-size:9px}.file-info{display:flex;flex-direction:column;gap:5px}.file-info b{font-size:13px}.file-info small{font-size:11px;color:#8a939f}.more{margin-left:auto;color:#9aa2ad;font-weight:bold}.nav{height:68px;position:absolute;bottom:0;left:0;right:0;background:#fff;border-top:1px solid #e5e8ec;display:flex;justify-content:space-around;padding-top:8px}.nav button{color:#89929e;display:flex;flex-direction:column;align-items:center;gap:3px;font-size:11px;min-width:80px}.nav i{font-style:normal;font-size:22px;line-height:24px}.nav .active{color:#3370ff;font-weight:600}.empty,.loading{color:#8a919f;text-align:center;padding:40px 16px}.loading{display:grid;place-items:center;height:100%}@media(max-width:600px){.stage{padding:0}.phone{width:100%;height:100dvh;border:0;border-radius:0;box-shadow:none}.capture-screen{padding-bottom:calc(190px + env(safe-area-inset-bottom))}.nav{height:calc(68px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom)}.bottom-action{bottom:calc(68px + env(safe-area-inset-bottom))}}
 .photo,.add-photo{width:92px;height:92px;border-radius:10px}.photo{box-shadow:0 2px 7px #1e293b22}.photo::after{content:"";position:absolute;inset:48% 0 0;background:linear-gradient(transparent,#111b)}.photo img{width:100%;height:100%;display:block;object-fit:cover}.photo span{z-index:1;bottom:7px;left:7px;right:7px;font-size:10px;line-height:14px;text-shadow:0 1px 2px #000}.remove-photo{z-index:2;right:6px;top:6px;width:26px;height:26px;padding:0;border-radius:50%;background:#17212be6;border:1px solid #ffffff80;color:#fff;font-size:22px;line-height:22px;font-weight:300;display:grid;place-items:center;box-shadow:0 2px 5px #0004}.remove-photo:active{transform:scale(.9);background:#d84b45}.add-photo{border-width:1.5px}.add-photo i{font-size:28px}.add-photo span{font-size:11px;margin-top:7px}.camera-error{margin:0 4px 10px;padding:9px 11px;border-radius:8px;background:#fff1f0;color:#c53a32;font-size:12px}
-.capture-progress{margin:14px 3px 8px}.capture-progress>div:first-child{display:flex;justify-content:space-between;margin-bottom:7px;font-size:12px}.capture-progress span{color:#7d8794}.task-tabs{display:flex;overflow-x:auto;gap:22px;border-bottom:1px solid #e6e9ee;white-space:nowrap;scroll-snap-type:x mandatory}.task-tabs button{position:relative;flex:none;padding:10px 2px;color:#737d89;font-size:13px;scroll-snap-align:center}.task-tabs button.active{color:#3370ff;border-bottom:2px solid #3370ff;font-weight:600}.task-tabs button.done{color:#1d9b64}.task-tabs button i{position:absolute;width:6px;height:6px;border-radius:50%;background:#ef6457;top:7px;right:-8px}.task-swipe{touch-action:pan-y}.bottom-action small{display:block;text-align:center;color:#7f8995;font-size:11px;padding:2px 0 7px}.upload-overlay{position:absolute;z-index:30;inset:0;display:grid;place-items:center;background:#17233c66;backdrop-filter:blur(2px)}.upload-dialog{width:230px;padding:25px 20px;border-radius:16px;text-align:center;background:#fff;box-shadow:0 15px 36px #17233c44}.upload-dialog b{display:block;font-size:17px}.upload-dialog p{margin-top:9px;color:#747e8a;font-size:12px;line-height:18px}.upload-dialog button{margin-top:14px;padding:8px 26px;border-radius:8px;background:#3370ff;color:#fff}.spinner{width:30px;height:30px;margin:0 auto 15px;border:3px solid #dce7ff;border-top-color:#3370ff;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.capture-progress{margin:14px 3px 8px}.capture-progress>div:first-child{display:flex;justify-content:space-between;margin-bottom:7px;font-size:12px}.capture-progress span{color:#7d8794}.task-tab-strip{position:relative}.task-tabs-label{position:absolute;z-index:2;left:0;top:0;bottom:1px;width:76px;display:flex;align-items:center;background:#f5f7fa;color:#3f4752;font-size:12px;font-weight:700;box-shadow:8px 0 10px -10px #17233c}.task-tabs{display:flex;overflow-x:auto;gap:22px;padding-left:76px;border-bottom:1px solid #e6e9ee;white-space:nowrap;scroll-snap-type:x mandatory;scrollbar-width:none}.task-tabs::-webkit-scrollbar{display:none}.task-tabs button{position:relative;flex:none;padding:10px 2px;color:#737d89;font-size:13px;scroll-snap-align:center}.task-tabs button.active{color:#3370ff;border-bottom:2px solid #3370ff;font-weight:600}.task-tabs button.done{color:#1d9b64}.task-tabs button i{position:absolute;width:6px;height:6px;border-radius:50%;background:#ef6457;top:7px;right:-8px}.task-swipe{touch-action:pan-y}.supplemental-note{display:block;margin:12px 0 2px 26px}.supplemental-note span{display:block;margin-bottom:6px;color:#596273;font-size:11px;font-weight:600}.supplemental-note textarea{display:block;width:100%;min-height:72px;resize:vertical;border:1px solid #dfe4ec;border-radius:8px;padding:9px 10px;background:#fafbfc;color:#29303a;font:12px/1.5 inherit;outline:none}.supplemental-note textarea:focus{border-color:#3370ff;box-shadow:0 0 0 2px #3370ff18}.supplemental-note textarea:disabled{color:#7d8794;background:#f1f3f6}.bottom-action small{display:block;text-align:center;color:#7f8995;font-size:11px;padding:2px 0 7px}.upload-overlay{position:absolute;z-index:30;inset:0;display:grid;place-items:center;background:#17233c66;backdrop-filter:blur(2px)}.upload-dialog{width:230px;padding:25px 20px;border-radius:16px;text-align:center;background:#fff;box-shadow:0 15px 36px #17233c44}.upload-dialog b{display:block;font-size:17px}.upload-dialog p{margin-top:9px;color:#747e8a;font-size:12px;line-height:18px}.upload-dialog button{margin-top:14px;padding:8px 26px;border-radius:8px;background:#3370ff;color:#fff}.spinner{width:30px;height:30px;margin:0 auto 15px;border:3px solid #dce7ff;border-top-color:#3370ff;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
 .contract-card.completed{background:#f0f2f4;box-shadow:none;color:#747c86}.contract-card.completed .tag-row span{background:#e2e5e8;color:#7e8690}.contract-card.completed .progress{background:#d8dde2}.contract-card.completed .progress i{background:#98a1ab}.contract-card.completed footer b{color:#68717b}.status.done{background:#e1e4e7;color:#68717b}.edit-task{margin-left:auto;color:#3370ff;font-size:12px;padding:5px 8px;background:#edf3ff;border-radius:6px}.group-head .edit-task+small{margin-left:0}
 .bottom-action{z-index:20}.nav{z-index:21}.photo,.remove-photo,.photo span{z-index:1}.photo span{z-index:2}.remove-photo{z-index:3}
 .gallery-filters{display:flex;gap:7px;margin:15px 0 10px;overflow-x:auto;padding-bottom:2px}.filter-select{flex:none;display:flex;align-items:center;gap:4px;padding:0 8px;height:32px;border:1px solid #dfe5ec;border-radius:8px;background:#fff;color:#596573;font-size:11px}.filter-select span{color:#8a94a1}.filter-select select{max-width:92px;border:0;background:transparent;color:#334155;font:inherit;outline:0}.date-chip.selected{border-color:#8eb1ff;color:#2863db}.date-filter{display:flex;align-items:end;gap:8px;padding:10px;margin-bottom:9px;border-radius:9px;background:#fff;border:1px solid #e5eaf0}.date-filter label{display:flex;flex-direction:column;gap:4px;font-size:10px;color:#7d8794}.date-filter input{width:118px;border:1px solid #dfe5ec;border-radius:5px;padding:4px;font:inherit;font-size:11px}.date-filter button{font-size:11px;color:#3370ff;padding:5px}.gallery-actions{display:flex;align-items:center;gap:5px}.gallery-actions button{height:25px;min-width:25px;border:1px solid #e0e5eb;border-radius:5px;color:#7b8592;font-size:13px}.gallery-actions .sort-button{padding:0 7px;font-size:11px}.gallery-actions button.active{background:#edf3ff;border-color:#9bbcfb;color:#3370ff}.gallery.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.gallery.grid .gallery-item{display:block;padding:6px}.gallery.grid .thumb{width:100%;height:120px;display:block}.gallery.grid .file-info{padding:7px 2px 2px}.gallery.grid .file-info b{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.thumb{object-fit:cover;background:#dde4e9}.gallery-item .thumb{flex:none}

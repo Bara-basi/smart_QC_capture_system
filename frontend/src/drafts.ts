@@ -3,6 +3,7 @@ export type PhotoDraft = {
   contractNo: string
   taskId: string
   inspectionItem: string
+  inspectionNote?: string
   capturedAt: string
   image: Blob
   createdAt: number

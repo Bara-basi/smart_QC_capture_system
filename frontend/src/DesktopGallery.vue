@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 
-type GalleryPhoto = { id: string; contract_no: string; product_type: string; specification: string; inspection_item: string; captured_at: string; photographer_name: string }
+type GalleryPhoto = { id: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string }
 type GalleryResponse = { photos: GalleryPhoto[]; count: number }
 type CurrentUser = { id: string; name: string; avatar_url: string | null }
 type Scope = 'mine' | 'shared'
@@ -131,7 +131,7 @@ onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser
           <div v-else-if="photos.length" class="photo-grid" :class="view">
             <button v-for="photo in photos" :key="photo.id" class="photo-card" @click="openPhoto(photo)">
               <img :src="photoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`">
-              <div class="photo-meta"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ formatDate(photo.captured_at) }}</small><small v-if="scope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div>
+              <div class="photo-meta"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ formatDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="scope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div>
             </button>
           </div>
           <div v-else class="state empty"><strong>未找到符合条件的照片</strong><span>请调整搜索内容或筛选条件后重试</span><button v-if="keyword || activeFilterCount" @click="keyword = ''; resetFilters()">清空搜索与筛选</button></div>
@@ -142,7 +142,7 @@ onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser
     <div v-if="selected" class="viewer" role="dialog" aria-modal="true" :aria-label="`${selected.contract_no} 照片预览`" @click.self="selected = null">
       <header><div><p>{{ selected.contract_no }}</p><b>{{ selected.product_type }}<template v-if="selected.specification"> · {{ selected.specification }}</template> · {{ selected.inspection_item }}</b></div><div><a :href="photoUrl(selected, 'download')" target="_blank" rel="noopener">⇩ 下载原图</a><button aria-label="关闭预览" @click="selected = null">×</button></div></header>
       <div class="viewer-stage"><img class="preview" :src="photoUrl(selected, 'preview')" alt=""><img class="full" :class="{ ready: fullLoaded }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span></div>
-      <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>按 Esc 关闭</span></footer>
+      <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="selected.inspection_note"> · 备注：{{ selected.inspection_note }}</template><template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>按 Esc 关闭</span></footer>
     </div>
   </main>
 </template>
