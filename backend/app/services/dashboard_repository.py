@@ -27,6 +27,7 @@ SUPPLEMENTAL_REQUIREMENT = "补充拍照"
 class PhotoCommitResult:
     photo_ids: list[str]
     sync_job_ids: list[int]
+    deleted_objects: list[tuple[str, str]]
 
 
 def _dsn() -> str:
@@ -244,15 +245,36 @@ async def create_photo_record(values: dict[str, Any]) -> str:
         await connection.close()
 
 
-async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> PhotoCommitResult:
-    """Persist photos and transactionally queue any newly completed Feishu statuses."""
+async def commit_photo_records(
+    user_id: str,
+    values: list[dict[str, Any]],
+    delete_photo_ids: list[str] | None = None,
+    contract_no: str | None = None,
+) -> PhotoCommitResult:
+    """Atomically apply new/deleted photos and queue completed Feishu statuses."""
+    delete_photo_ids = sorted(set(delete_photo_ids or []))
     connection = await asyncpg.connect(_dsn())
     try:
         async with connection.transaction():
             user = await connection.fetchrow("SELECT open_id, name FROM users WHERE id = $1::uuid", user_id)
             if not user:
                 raise LookupError("Current user no longer exists")
+            deleted_rows = await connection.fetch(
+                """SELECT id::text AS id, task_feishu_record_id, contract_no,
+                          oss_object_key, preview_oss_object_key
+                   FROM photo_records
+                   WHERE id::text = ANY($1::text[]) AND photographer_open_id = $2
+                   FOR UPDATE""",
+                delete_photo_ids,
+                user["open_id"],
+            ) if delete_photo_ids else []
+            if len(deleted_rows) != len(delete_photo_ids):
+                raise LookupError("One or more photos selected for deletion are unavailable")
+            if contract_no and any(str(row["contract_no"]) != contract_no for row in deleted_rows):
+                raise LookupError("One or more photos do not belong to this contract")
+
             task_ids = [value["task_id"] for value in values]
+            task_ids.extend(str(row["task_feishu_record_id"]) for row in deleted_rows)
             tasks = await connection.fetch(
                 """SELECT feishu_record_id, contract_no, sequence_no, specification, product_type
                    FROM inspection_photo_tasks WHERE feishu_record_id = ANY($1::varchar[]) AND inspector_open_id = $2""",
@@ -261,6 +283,11 @@ async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> Ph
             task_map = {str(task["feishu_record_id"]): task for task in tasks}
             if len(task_map) != len(set(task_ids)):
                 raise LookupError("One or more capture tasks are unavailable")
+            if delete_photo_ids:
+                await connection.execute(
+                    "DELETE FROM photo_records WHERE id::text = ANY($1::text[])",
+                    delete_photo_ids,
+                )
             ids = []
             for value in values:
                 task = task_map[value["task_id"]]
@@ -300,6 +327,9 @@ async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> Ph
                 captured_items[str(photo["task_feishu_record_id"])].add(str(photo["inspection_item"]))
 
             completed_task_ids, completed_contracts = _completion_statuses(contract_tasks, captured_items)
+            incomplete_edited_tasks = set(task_ids) - set(completed_task_ids)
+            if incomplete_edited_tasks:
+                raise ValueError("编辑后的照片仍有必拍项缺失")
             if completed_task_ids:
                 await connection.execute(
                     """UPDATE inspection_photo_tasks SET inspection_status = $2
@@ -333,7 +363,15 @@ async def commit_photo_records(user_id: str, values: list[dict[str, Any]]) -> Ph
                     record_ids=order_record_ids,
                 )
             )
-            return PhotoCommitResult(photo_ids=ids, sync_job_ids=sync_job_ids)
+            deleted_objects = [
+                (str(row["oss_object_key"]), str(row["preview_oss_object_key"]))
+                for row in deleted_rows
+            ]
+            return PhotoCommitResult(
+                photo_ids=ids,
+                sync_job_ids=sync_job_ids,
+                deleted_objects=deleted_objects,
+            )
     finally:
         await connection.close()
 

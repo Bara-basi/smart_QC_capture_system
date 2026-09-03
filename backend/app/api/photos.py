@@ -57,12 +57,14 @@ MAX_IMAGE_BYTES = 15 * 1024 * 1024
 
 
 @router.post("/commit")
-async def commit_photos(request: Request, manifest: str = Form(...), files: list[UploadFile] = File(...)) -> dict[str, object]:
+async def commit_photos(request: Request, manifest: str = Form(...), files: list[UploadFile] | None = File(default=None)) -> dict[str, object]:  # noqa: B008
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    files = files or []
     payload = _manifest(manifest, len(files))
     items: list[dict[str, object]] = payload["photos"]
+    delete_photo_ids: list[str] = payload["delete_photo_ids"]
     try:
         task_map = await commit_task_metadata(str(user_id), [str(item["task_feishu_record_id"]) for item in items], str(payload["contract_no"]))
     except LookupError as exc:
@@ -106,7 +108,13 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
                 asyncio.to_thread(upload_image, settings.oss_bucket, str(photo["oss_object_key"]), bytes(photo["watermarked"]), str(photo["content_type"])),
                 asyncio.to_thread(upload_image, settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"])),
             )
-        commit_result = await commit_photo_records(str(user_id), prepared)
+        commit_result = await commit_photo_records(
+            str(user_id), prepared, delete_photo_ids=delete_photo_ids,
+            contract_no=str(payload["contract_no"]),
+        )
+    except (LookupError, ValueError) as exc:
+        await _cleanup_uploaded(uploaded)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except FeishuStatusSyncConfigurationError as exc:
         await _cleanup_uploaded(uploaded)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -123,9 +131,20 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         # upload failure here, otherwise the client may upload the same batch twice.
         logger.exception("Immediate Feishu status synchronization failed; queued for retry")
         feishu_sync = {"synced": 0, "pending": len(commit_result.sync_job_ids)}
+    await _cleanup_uploaded(
+        [
+            pair
+            for original_key, preview_key in commit_result.deleted_objects
+            for pair in (
+                (settings.oss_bucket, original_key),
+                (settings.oss_preview_bucket, preview_key),
+            )
+        ]
+    )
     return {
         "photo_ids": commit_result.photo_ids,
         "count": len(commit_result.photo_ids),
+        "deleted_count": len(commit_result.deleted_objects),
         "feishu_sync": feishu_sync,
     }
 
@@ -163,8 +182,15 @@ def _manifest(value: str, file_count: int) -> dict[str, object]:
     if not isinstance(payload, dict) or not isinstance(payload.get("contract_no"), str) or not isinstance(payload.get("photos"), list):
         raise HTTPException(status_code=400, detail="Invalid upload manifest")
     items = payload["photos"]
-    if not items or len(items) != file_count:
+    delete_photo_ids = payload.get("delete_photo_ids", [])
+    if not isinstance(delete_photo_ids, list) or any(not isinstance(photo_id, str) or not photo_id.strip() for photo_id in delete_photo_ids):
+        raise HTTPException(status_code=400, detail="Invalid deleted photo IDs")
+    delete_photo_ids = [photo_id.strip() for photo_id in delete_photo_ids]
+    if len(delete_photo_ids) != len(set(delete_photo_ids)):
+        raise HTTPException(status_code=400, detail="Duplicate deleted photo IDs")
+    if (not items and not delete_photo_ids) or len(items) != file_count:
         raise HTTPException(status_code=400, detail="Every submitted photo must have one file")
+    payload["delete_photo_ids"] = delete_photo_ids
     indexes = set()
     for item in items:
         if not isinstance(item, dict) or not isinstance(item.get("file_index"), int) or not isinstance(item.get("task_feishu_record_id"), str) or not isinstance(item.get("inspection_item"), str) or not isinstance(item.get("client_captured_at"), str):

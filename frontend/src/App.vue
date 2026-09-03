@@ -38,6 +38,7 @@ const submitStatus = ref<'idle' | 'uploading' | 'success' | 'error'>('idle')
 const touchStartX = ref(0)
 const taskTabs = ref<HTMLElement | null>(null)
 const editingTaskIds = ref<Set<string>>(new Set())
+const editBaselinePhotoIds = ref<Record<string, string[]>>({})
 const supplementalNotes = ref<Record<string, string>>({})
 const galleryPhotos = ref<GalleryPhoto[]>([])
 const galleryLoading = ref(false)
@@ -86,6 +87,7 @@ const todayText = computed(() => `今天有 ${dashboard.value?.pending_task_coun
 const photoKey = (taskId: string, requirement: string) => `${taskId}:${requirement}`
 const currentTask = computed(() => activeTask.value?.tasks[openSubtask.value] || null)
 const isTaskComplete = computed(() => currentTask.value?.requirements.filter(item => item.mandatory).every(item => (photos.value[photoKey(currentTask.value!.feishu_record_id, item.name)] || []).length > 0) ?? false)
+const currentTaskHasEdits = computed(() => currentTask.value ? taskHasPhotoEdits(currentTask.value.feishu_record_id) : false)
 const completedTaskCount = computed(() => activeTask.value?.tasks.filter(task => uploadedTaskIds.value.has(task.feishu_record_id)).length || 0)
 const captureProgress = computed(() => activeTask.value?.tasks.length ? completedTaskCount.value / activeTask.value.tasks.length * 100 : 0)
 const galleryPartLabel = computed(() => partOptions.find(option => option.value === galleryPart.value)?.label || '全部部位')
@@ -375,6 +377,7 @@ async function openGallery() {
 async function openTask(recordId: string) {
   activeTask.value = await request<CaptureTask>(`/api/v1/dashboard/tasks/${recordId}`)
   photos.value = {}
+  editBaselinePhotoIds.value = {}
   supplementalNotes.value = {}
   uploadedTaskIds.value = new Set(activeTask.value.tasks.filter(task => task.uploaded).map(task => task.feishu_record_id))
   restoreSavedPhotos()
@@ -487,21 +490,9 @@ async function optimizePhotoForUpload(source: Blob): Promise<Blob> {
 
 async function removePhoto(taskId: string, requirement: string, index: number) {
   const removed = photos.value[photoKey(taskId, requirement)]?.splice(index, 1)[0]
-  if (removed) {
-    URL.revokeObjectURL(removed.url)
-    try {
-      if (removed.draftId) await removeDraft(removed.draftId)
-      if (removed.recordId) {
-        const response = await fetch(`/api/v1/photos/${removed.recordId}`, { method: 'DELETE', credentials: 'include' })
-        if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '删除已上传照片失败')
-        editingTaskIds.value = new Set([...editingTaskIds.value, taskId])
-        uploadedTaskIds.value = new Set([...uploadedTaskIds.value].filter(id => id !== taskId))
-      }
-    } catch (cause) {
-      photos.value[photoKey(taskId, requirement)]?.splice(index, 0, removed)
-      cameraError.value = cause instanceof Error ? cause.message : '删除照片失败'
-    }
-  }
+  if (!removed) return
+  if (removed.url.startsWith('blob:')) URL.revokeObjectURL(removed.url)
+  if (removed.draftId) await removeDraft(removed.draftId)
 }
 
 function restoreSavedPhotos() {
@@ -515,7 +506,28 @@ function restoreSavedPhotos() {
   }
 }
 
-function editTask(taskId: string) { editingTaskIds.value = new Set([...editingTaskIds.value, taskId]) }
+function taskPhotos(taskId: string): Photo[] {
+  return Object.entries(photos.value)
+    .filter(([key]) => key.startsWith(`${taskId}:`))
+    .flatMap(([, list]) => list)
+}
+
+function savedPhotoIds(taskId: string): string[] {
+  return taskPhotos(taskId).flatMap(photo => photo.recordId ? [photo.recordId] : []).sort()
+}
+
+function taskHasPhotoEdits(taskId: string): boolean {
+  const baseline = editBaselinePhotoIds.value[taskId]
+  if (!baseline) return false
+  if (taskPhotos(taskId).some(photo => photo.draftId)) return true
+  const current = savedPhotoIds(taskId)
+  return current.length !== baseline.length || current.some((id, index) => id !== baseline[index])
+}
+
+function editTask(taskId: string) {
+  editBaselinePhotoIds.value = { ...editBaselinePhotoIds.value, [taskId]: savedPhotoIds(taskId) }
+  editingTaskIds.value = new Set([...editingTaskIds.value, taskId])
+}
 
 async function restoreDrafts() {
   if (!activeTask.value) return
@@ -542,23 +554,26 @@ function draftPreview(draft: PhotoDraft): string {
 }
 
 async function submitPhotos(taskId: string) {
-  if (!activeTask.value || isSubmitting.value || (uploadedTaskIds.value.has(taskId) && !editingTaskIds.value.has(taskId))) return
+  const editing = editingTaskIds.value.has(taskId)
+  if (!activeTask.value || isSubmitting.value || (uploadedTaskIds.value.has(taskId) && !editing) || (editing && !taskHasPhotoEdits(taskId))) return
   submitError.value = ''
   submitStatus.value = 'uploading'
   isSubmitting.value = true
   try {
     const drafts = (await draftsForContract(activeTask.value.contract_no)).filter(draft => draft.taskId === taskId)
-    if (!drafts.length && !editingTaskIds.value.has(taskId)) throw new Error('未找到待上传照片，请重新拍摄')
-    if (drafts.length) {
-      const form = new FormData()
-      form.append('manifest', JSON.stringify({ contract_no: activeTask.value.contract_no, photos: drafts.map((draft, index) => ({ file_index: index, task_feishu_record_id: draft.taskId, inspection_item: draft.inspectionItem, inspection_note: draft.inspectionItem === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', client_captured_at: draft.capturedAt })) }))
-      drafts.forEach((draft, index) => form.append('files', draft.image, `capture-${index}.jpg`))
-      const response = await fetchWithTimeout('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form }, UPLOAD_REQUEST_TIMEOUT_MS)
-      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '提交上传失败')
-      await removeDrafts(drafts.map(draft => draft.id))
-    }
+    const currentSavedIds = new Set(savedPhotoIds(taskId))
+    const deletePhotoIds = (editBaselinePhotoIds.value[taskId] || []).filter(id => !currentSavedIds.has(id))
+    if (!drafts.length && !deletePhotoIds.length) throw new Error('照片没有发生变化')
+    const form = new FormData()
+    form.append('manifest', JSON.stringify({ contract_no: activeTask.value.contract_no, delete_photo_ids: deletePhotoIds, photos: drafts.map((draft, index) => ({ file_index: index, task_feishu_record_id: draft.taskId, inspection_item: draft.inspectionItem, inspection_note: draft.inspectionItem === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', client_captured_at: draft.capturedAt })) }))
+    drafts.forEach((draft, index) => form.append('files', draft.image, `capture-${index}.jpg`))
+    const response = await fetchWithTimeout('/api/v1/photos/commit', { method: 'POST', credentials: 'include', body: form }, UPLOAD_REQUEST_TIMEOUT_MS)
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '提交上传失败')
+    await removeDrafts(drafts.map(draft => draft.id))
     Object.entries(photos.value).filter(([key]) => key.startsWith(`${taskId}:`)).forEach(([, list]) => list.forEach(photo => { if (photo.url.startsWith('blob:')) URL.revokeObjectURL(photo.url) }))
     editingTaskIds.value = new Set([...editingTaskIds.value].filter(id => id !== taskId))
+    const { [taskId]: _completedBaseline, ...remainingBaselines } = editBaselinePhotoIds.value
+    editBaselinePhotoIds.value = remainingBaselines
     const refreshed = await request<CaptureTask>(`/api/v1/dashboard/tasks/${taskId}`)
     activeTask.value = refreshed
     photos.value = {}
@@ -617,7 +632,7 @@ onMounted(async () => {
           <header class="topbar capture-topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
-          <div class="task-tab-strip"><span class="task-tabs-label">合同序号</span><div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.sequence_no || `任务 ${index + 1}` }}</span></button></div></div>
+          <div class="task-tab-strip"><span class="task-tabs-label">合同序号</span><div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.sequence_no?.trim() || String(index + 1) }}</span></button></div></div>
           <p class="hint">带 <em>*</em> 的项目为必拍项；左右滑动可切换合同序号任务。</p>
           <p v-if="cameraError" class="camera-error">{{ cameraError }}</p>
           <p v-if="submitError" class="camera-error">{{ submitError }}</p>
@@ -633,7 +648,7 @@ onMounted(async () => {
               </div>
             </div>
           </div>
-          <div class="capture-spacer"/><div v-if="currentTask && (!uploadedTaskIds.has(currentTask.feishu_record_id) || editingTaskIds.has(currentTask.feishu_record_id))" class="bottom-action"><small v-if="isTaskComplete && !isSubmitting">草稿仅保存在本机，确认后才上传</small><button :disabled="!isTaskComplete || isSubmitting" @click="submitPhotos(currentTask.feishu_record_id)">{{ isSubmitting ? '正在上传…' : isTaskComplete ? (editingTaskIds.has(currentTask.feishu_record_id) ? '编辑并上传' : '完成并上传') : '请先完成必拍项' }}</button></div>
+          <div class="capture-spacer"/><div v-if="currentTask && (!uploadedTaskIds.has(currentTask.feishu_record_id) || editingTaskIds.has(currentTask.feishu_record_id))" class="bottom-action"><small v-if="isTaskComplete && !isSubmitting">{{ editingTaskIds.has(currentTask.feishu_record_id) ? (currentTaskHasEdits ? '将同步新增照片并删除已移除的旧照片' : '请先新增或删除照片') : '草稿仅保存在本机，确认后才上传' }}</small><button :disabled="!isTaskComplete || isSubmitting || (editingTaskIds.has(currentTask.feishu_record_id) && !currentTaskHasEdits)" @click="submitPhotos(currentTask.feishu_record_id)">{{ isSubmitting ? '正在上传…' : isTaskComplete ? (editingTaskIds.has(currentTask.feishu_record_id) ? '编辑并上传' : '完成并上传') : '请先完成必拍项' }}</button></div>
           <div v-if="submitStatus !== 'idle'" class="upload-overlay"><div class="upload-dialog"><div v-if="submitStatus === 'uploading'" class="spinner"/><b>{{ submitStatus === 'uploading' ? '正在上传图片…' : submitStatus === 'success' ? '上传成功' : '上传失败' }}</b><p>{{ submitStatus === 'uploading' ? '请勿关闭当前页面' : submitStatus === 'success' ? '当前规格任务已完成' : submitError }}</p><button v-if="submitStatus === 'error'" @click="submitStatus = 'idle'">知道了</button></div></div>
         </section>
 

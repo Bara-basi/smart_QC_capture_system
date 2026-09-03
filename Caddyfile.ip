@@ -37,6 +37,9 @@ https://{$APP_IP} {
     }
 
     handle {
+        # Always revalidate the SPA entry so Feishu WebViews receive the newly
+        # fingerprinted JavaScript bundle immediately after deployment.
+        header Cache-Control "no-cache"
         root * /srv
         try_files {path} /index.html
         file_server

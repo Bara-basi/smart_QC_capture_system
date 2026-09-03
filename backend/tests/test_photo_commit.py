@@ -35,6 +35,35 @@ def test_manifest_rejects_unmatched_files() -> None:
     assert error.value.status_code == 400
 
 
+def test_manifest_accepts_delete_only_edit() -> None:
+    manifest = _manifest(
+        '{"contract_no":"26MT-03T005","delete_photo_ids":["photo-1"],"photos":[]}',
+        0,
+    )
+
+    assert manifest["delete_photo_ids"] == ["photo-1"]
+
+
+def test_manifest_rejects_edit_without_any_changes() -> None:
+    with pytest.raises(HTTPException) as error:
+        _manifest(
+            '{"contract_no":"26MT-03T005","delete_photo_ids":[],"photos":[]}',
+            0,
+        )
+
+    assert error.value.status_code == 400
+
+
+def test_manifest_rejects_duplicate_deleted_photo_ids() -> None:
+    with pytest.raises(HTTPException) as error:
+        _manifest(
+            '{"contract_no":"26MT-03T005","delete_photo_ids":["photo-1","photo-1"],"photos":[]}',
+            0,
+        )
+
+    assert error.value.status_code == 400
+
+
 def test_search_tokens_split_chinese_and_whitespace_terms() -> None:
     assert _search_tokens("26MT-03T005，法兰  材质光谱") == ["26MT-03T005", "法兰", "材质光谱"]
 

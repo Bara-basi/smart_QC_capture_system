@@ -37,6 +37,9 @@
     }
 
     handle {
+        # Always revalidate the SPA entry so a deployment can point clients to
+        # the newly fingerprinted JavaScript bundle immediately.
+        header Cache-Control "no-cache"
         root * /srv
         try_files {path} /index.html
         file_server
