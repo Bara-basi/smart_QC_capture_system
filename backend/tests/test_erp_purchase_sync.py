@@ -1,13 +1,24 @@
-import pytest
+from pathlib import PurePosixPath
 
+import pytest
 from scripts.sync_erp_purchases import (
     ProductTask,
     PurchaseOrder,
+    _default_factory_mapping_candidates,
     _factory_backfill_plan,
     _order_create_records,
     _task_write_plan,
     factory_name,
 )
+
+
+def test_linux_container_prefers_app_data_for_factory_mapping() -> None:
+    candidates = _default_factory_mapping_candidates(
+        PurePosixPath("/app/scripts/sync_erp_purchases.py")
+    )
+
+    assert candidates[0] == PurePosixPath("/app/data/factroy_mapping.json")
+    assert candidates[1] == PurePosixPath("/data/factroy_mapping.json")
 
 
 def _order(stage: str = "待检") -> PurchaseOrder:

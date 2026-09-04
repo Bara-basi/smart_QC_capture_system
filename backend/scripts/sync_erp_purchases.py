@@ -33,7 +33,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
@@ -65,9 +65,7 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_SNAPSHOT_FILE = (
     Path(__file__).resolve().parents[1] / "data" / "erp_purchase_snapshot.json"
 )
-FACTORY_MAPPING_FILE = (
-    Path(__file__).resolve().parents[2] / "data" / "factroy_mapping.json"
-)
+FACTORY_MAPPING_FILENAME = "factroy_mapping.json"
 ORDER_CODE_PATTERN = re.compile(
     r"^(?:\d{2}MT|SP)-?(?:\d{2}[A-Z]\d{3}Y?|DP\d{3})",
     re.IGNORECASE,
@@ -153,18 +151,47 @@ def _normalize_factory_token(value: str) -> str:
     return re.sub(r"[\s_-]+", "", value).upper()
 
 
+def _default_factory_mapping_candidates(
+    script_file: PurePath,
+) -> tuple[PurePath, PurePath]:
+    """Return container and source-checkout locations, in preference order."""
+    return (
+        script_file.parents[1] / "data" / FACTORY_MAPPING_FILENAME,
+        script_file.parents[2] / "data" / FACTORY_MAPPING_FILENAME,
+    )
+
+
+@lru_cache(maxsize=1)
+def _factory_mapping_file() -> Path:
+    configured = os.getenv("FACTORY_MAPPING_FILE")
+    if configured:
+        path = Path(configured).expanduser().resolve()
+        if path.is_file():
+            return path
+        raise ValueError(f"Configured factory mapping file does not exist: {path}")
+
+    candidates = tuple(
+        Path(candidate)
+        for candidate in _default_factory_mapping_candidates(Path(__file__).resolve())
+    )
+    for path in candidates:
+        if path.is_file():
+            return path
+    checked = ", ".join(str(path) for path in candidates)
+    raise ValueError(f"Factory mapping file not found; checked: {checked}")
+
+
 @lru_cache(maxsize=1)
 def _factory_aliases() -> tuple[tuple[str, str], ...]:
+    mapping_file = _factory_mapping_file()
     try:
-        payload = json.loads(FACTORY_MAPPING_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(mapping_file.read_text(encoding="utf-8"))
         aliases = payload["aliases"]
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
-        raise ValueError(
-            f"Invalid factory mapping file: {FACTORY_MAPPING_FILE}"
-        ) from exc
+        raise ValueError(f"Invalid factory mapping file: {mapping_file}") from exc
     if not isinstance(aliases, dict):
         raise ValueError(  # noqa: TRY004 - malformed user-maintained configuration
-            f"Factory mapping aliases must be an object: {FACTORY_MAPPING_FILE}"
+            f"Factory mapping aliases must be an object: {mapping_file}"
         )
     normalized: list[tuple[str, str]] = []
     for alias, factory in aliases.items():
@@ -843,6 +870,14 @@ def sync_to_feishu(
     task_records, task_updates = _task_write_plan(
         feishu.existing_tasks(), orders, active_stages
     )
+    purchase_date_field = (
+        feishu.ensure_purchase_date_field(create_if_missing=ensure_schema)
+        if orders
+        else "采购时间"
+    )
+    # Build every order record before the first write. This validates the factory
+    # mapping and purchase dates without leaving a partial synchronization behind.
+    order_records = _order_create_records(orders, purchase_date_field)
 
     # Tasks are inserted first. If a later order insert fails, the next run can
     # deduplicate by natural key, update its stage, and retry the order record.
@@ -856,12 +891,6 @@ def sync_to_feishu(
         task_updates,
         label="inspection task stages",
     )
-    purchase_date_field = (
-        feishu.ensure_purchase_date_field(create_if_missing=ensure_schema)
-        if orders
-        else "采购时间"
-    )
-    order_records = _order_create_records(orders, purchase_date_field)
     created_orders = feishu.batch_create(
         settings.feishu_bitable_order_table_id,
         order_records,
