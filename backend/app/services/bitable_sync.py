@@ -143,7 +143,10 @@ async def _upsert_tasks(
     connection: asyncpg.Connection,
     contract_no: str,
     records: list[dict[str, Any]],
-    union_ids: dict[str, str | None],
+    *,
+    inspector_open_id: str,
+    inspector_union_id: str | None,
+    inspector_name: str | None,
 ) -> int:
     count = 0
     for record in records:
@@ -153,12 +156,6 @@ async def _upsert_tasks(
         record_id = record.get("record_id")
         if not record_id:
             continue
-        inspector_open_id, inspector_name = _person_reference(
-            _find(fields, "质检员", "检验员", "inspector")
-        )
-        inspector_union_id = (
-            union_ids.get(inspector_open_id) if inspector_open_id else None
-        )
         await connection.execute(
             """INSERT INTO inspection_photo_tasks
                (feishu_record_id, contract_no, sequence_no, task_id, product_type, specification, quantity, inspection_stage,
@@ -202,16 +199,6 @@ def _record_ids(payload: dict[str, Any]) -> set[str]:
             if record_id:
                 record_ids.add(record_id)
     return record_ids
-
-
-def _inspector_open_ids(records: Iterable[dict[str, Any]]) -> set[str]:
-    open_ids: set[str] = set()
-    for record in records:
-        fields = record.get("fields") or {}
-        open_id, _ = _person_reference(_find(fields, "质检员", "检验员", "inspector"))
-        if open_id:
-            open_ids.add(open_id)
-    return open_ids
 
 
 def _affected_rows(command_tag: str) -> int:
@@ -261,20 +248,36 @@ async def sync_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
             raise SyncValidationError(
                 "Order record needs record_id, 合同号 and 产品类型"
             )
+        inspector_open_id, inspector_name = _person_reference(
+            _find(order_fields, "质检员", "检验员", "inspector")
+        )
+        if not inspector_open_id:
+            raise SyncValidationError(
+                "Order record needs a 质检员 before it can be assigned"
+            )
+
+        # Do not bind this lookup to a Bitable view. A view may filter on the
+        # inspector field that another automation is still updating, which can
+        # make a successful webhook silently import only part of an order.
         task_records = [
             record
             async for record in client.search_records(
                 settings.feishu_bitable_table_id,
-                settings.feishu_bitable_inspection_task_view_id,
+                "",
                 field_name="合同号",
                 value=contract_no,
             )
             if _contract_no(record.get("fields") or {}) == contract_no
         ]
+        if not task_records:
+            raise SyncValidationError(
+                f"No inspection tasks were found for contract {contract_no}"
+            )
         union_ids = await _resolve_union_ids(
             client,
-            _inspector_open_ids([order_record, *task_records]),
+            {inspector_open_id},
         )
+        inspector_union_id = union_ids.get(inspector_open_id)
 
     connection = await asyncpg.connect(_dsn())
     try:
@@ -284,7 +287,9 @@ async def sync_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
                 connection,
                 contract_no,
                 task_records,
-                union_ids,
+                inspector_open_id=inspector_open_id,
+                inspector_union_id=inspector_union_id,
+                inspector_name=inspector_name,
             )
         result = {"order_items": 1, "inspection_photo_tasks": synced_tasks}
         logger.info(

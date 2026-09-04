@@ -105,8 +105,11 @@ Add an `X-QC-Sync-Secret` request header whose value matches
 ```
 
 Keep the JSON on one line and pass exactly one record ID. The endpoint reads
-that order directly by its Feishu record ID, then asks Bitable for only the
-inspection-task rows whose `合同号` is an exact match. All source columns are
+that order directly by its Feishu record ID, uses that order's `质检员` as the
+authoritative assignee, then searches the complete inspection-task table (not a
+potentially filtered view) for rows whose `合同号` is an exact match. A request
+with no inspector or no matching tasks is rejected instead of returning a false
+success. All source columns are
 preserved in `feishu_fields`; the queryable fields are
 `contract_no`, `product_type`, `inspection_status`, and inspector open/union ID
 and name. On a server, route this HTTPS path directly to FastAPI behind a

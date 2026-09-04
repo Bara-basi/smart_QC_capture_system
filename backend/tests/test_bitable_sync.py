@@ -203,7 +203,9 @@ class _FakeFeishuClient:
                 "数量": 2,
                 "质检阶段": "已到货",
                 "质检状态": "待拍照",
-                "质检员": [{"id": "ou_inspector", "name": "王质检"}],
+                # Simulate the race where the task-table automation has not
+                # copied the order's inspector into this row yet.
+                "质检员": [],
             },
         }
 
@@ -231,7 +233,7 @@ def test_webhook_reads_one_order_and_filtered_tasks_before_database_transaction(
     client = _FakeFeishuClient.last_instance
     assert client is not None
     assert client.get_calls == [("tbl_order", "rec_order")]
-    assert client.search_calls == [("tbl_task", "vew_task", "合同号", "26MT-001")]
+    assert client.search_calls == [("tbl_task", "", "合同号", "26MT-001")]
     assert client.person_calls == ["ou_inspector"]
     assert result == {"order_items": 1, "inspection_photo_tasks": 1}
     assert connection.closed is True
@@ -261,6 +263,30 @@ def test_webhook_reads_one_order_and_filtered_tasks_before_database_transaction(
         "ou_inspector",
         "on_inspector",
     )
+
+
+def test_webhook_rejects_empty_task_result_instead_of_returning_false_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_feishu(monkeypatch)
+
+    class EmptyTaskClient(_FakeFeishuClient):
+        async def search_records(
+            self,
+            table_id: str,
+            view_id: str,
+            *,
+            field_name: str,
+            value: str,
+        ) -> Any:
+            self.search_calls.append((table_id, view_id, field_name, value))
+            if False:
+                yield {}
+
+    monkeypatch.setattr(bitable_sync, "FeishuBitableClient", EmptyTaskClient)
+
+    with pytest.raises(bitable_sync.SyncValidationError, match="No inspection tasks"):
+        asyncio.run(bitable_sync.sync_order_webhook({"record_id": "rec_order"}))
 
 
 def test_webhook_rejects_missing_record_id_without_scanning(
