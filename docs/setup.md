@@ -104,9 +104,10 @@ Add an `X-QC-Sync-Secret` request header whose value matches
 {"record_id":"{{record_id}}"}
 ```
 
-The endpoint reads that record from the order view, upserts it by Feishu record
-ID, then reads matching-contract rows in the inspection-task view. All source
-columns are preserved in `feishu_fields`; the queryable fields are
+Keep the JSON on one line and pass exactly one record ID. The endpoint reads
+that order directly by its Feishu record ID, then asks Bitable for only the
+inspection-task rows whose `合同号` is an exact match. All source columns are
+preserved in `feishu_fields`; the queryable fields are
 `contract_no`, `product_type`, `inspection_status`, and inspector open/union ID
 and name. On a server, route this HTTPS path directly to FastAPI behind a
 reverse proxy instead of depending on the Vite development proxy.
