@@ -214,6 +214,14 @@ def _inspector_open_ids(records: Iterable[dict[str, Any]]) -> set[str]:
     return open_ids
 
 
+def _affected_rows(command_tag: str) -> int:
+    """Return the row count from an asyncpg command tag such as ``UPDATE 3``."""
+    try:
+        return int(command_tag.rsplit(" ", 1)[-1])
+    except (AttributeError, ValueError):
+        return 0
+
+
 async def _resolve_union_ids(
     client: FeishuBitableClient,
     open_ids: set[str],
@@ -284,6 +292,81 @@ async def sync_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
             selected_id,
             contract_no,
             synced_tasks,
+            monotonic() - started_at,
+        )
+        return result
+    finally:
+        await connection.close()
+
+
+async def unassign_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
+    """Remove one order's inspector assignment from the local application.
+
+    The order and task rows are deliberately retained so a later assignment can
+    reuse them and existing photo history keeps its task references.  The Feishu
+    automation owns clearing the corresponding Bitable cells.
+    """
+    started_at = monotonic()
+    if not settings.database_url:
+        raise RuntimeError("DATABASE_URL is not configured")
+    selected_ids = _record_ids(payload)
+    if len(selected_ids) != 1:
+        raise SyncValidationError(
+            "The webhook request must contain exactly one record_id"
+        )
+    selected_id = next(iter(selected_ids))
+
+    connection = await asyncpg.connect(_dsn())
+    try:
+        contract_no = await connection.fetchval(
+            "SELECT contract_no FROM order_items WHERE feishu_record_id = $1",
+            selected_id,
+        )
+        if not contract_no:
+            raise SyncValidationError(
+                f"No synchronized order was found for record_id {selected_id}"
+            )
+
+        async with connection.transaction():
+            order_result = await connection.execute(
+                """UPDATE order_items
+                   SET inspector_open_id = NULL,
+                       inspector_union_id = NULL,
+                       inspector_name = NULL,
+                       feishu_fields = feishu_fields
+                           - ARRAY['质检员', '检验员', 'inspector']::text[],
+                       updated_at = NOW()
+                   WHERE contract_no = $1
+                     AND (inspector_open_id IS NOT NULL
+                          OR inspector_union_id IS NOT NULL
+                          OR inspector_name IS NOT NULL
+                          OR feishu_fields ?| ARRAY['质检员', '检验员', 'inspector'])""",
+                contract_no,
+            )
+            task_result = await connection.execute(
+                """UPDATE inspection_photo_tasks
+                   SET inspector_open_id = NULL,
+                       inspector_union_id = NULL,
+                       inspector_name = NULL,
+                       updated_at = NOW()
+                   WHERE contract_no = $1
+                     AND (inspector_open_id IS NOT NULL
+                          OR inspector_union_id IS NOT NULL
+                          OR inspector_name IS NOT NULL)""",
+                contract_no,
+            )
+
+        result = {
+            "order_items": _affected_rows(order_result),
+            "inspection_photo_tasks": _affected_rows(task_result),
+        }
+        logger.info(
+            "Feishu order unassign complete: record_id=%s contract_no=%s "
+            "order_items=%d tasks=%d elapsed=%.3fs",
+            selected_id,
+            contract_no,
+            result["order_items"],
+            result["inspection_photo_tasks"],
             monotonic() - started_at,
         )
         return result

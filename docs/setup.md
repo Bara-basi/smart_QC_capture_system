@@ -112,6 +112,21 @@ preserved in `feishu_fields`; the queryable fields are
 and name. On a server, route this HTTPS path directly to FastAPI behind a
 reverse proxy instead of depending on the Vite development proxy.
 
+To revoke an assignment, configure the reset-button automation to POST the same
+header and body to:
+
+```text
+https://<your-domain>/api/v1/integrations/feishu/order-unassign
+```
+
+The reset automation may clear the Feishu cells before making this request. The
+endpoint resolves the already-synchronized order locally by `record_id`, clears
+the inspector identity from all local order items and photo tasks under that
+contract, and leaves task definitions and photo history intact. It does not
+write to either Bitable table; clearing Bitable task cells remains the reset
+automation's responsibility. Repeating the request is safe and returns zero
+updated rows after the assignment is already clear.
+
 ## 生产服务器部署（Docker Compose + Caddy）
 
 生产环境不需要 ngrok，也不运行 Vite。`docker-compose.production.yml` 会构建 Vue

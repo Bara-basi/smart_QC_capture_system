@@ -6,6 +6,7 @@ from typing import Any, Self
 
 import httpx
 import pytest
+
 from app.core.config import settings
 from app.integrations.feishu_bitable import FeishuBitableClient
 from app.services import bitable_sync
@@ -144,8 +145,12 @@ class _FakeConnection:
     def transaction(self) -> _FakeTransaction:
         return _FakeTransaction()
 
-    async def execute(self, query: str, *args: Any) -> None:
+    async def execute(self, query: str, *args: Any) -> str:
         self.executions.append((query, args))
+        return "UPDATE 0"
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        raise AssertionError(f"Unexpected fetchval: {query} {args}")
 
     async def close(self) -> None:
         self.closed = True
@@ -265,3 +270,67 @@ def test_webhook_rejects_missing_record_id_without_scanning(
 
     with pytest.raises(bitable_sync.SyncValidationError, match="one record_id"):
         asyncio.run(bitable_sync.sync_order_webhook({}))
+
+
+class _FakeUnassignConnection(_FakeConnection):
+    def __init__(self, contract_no: str | None = "26MT-001") -> None:
+        super().__init__()
+        self.contract_no = contract_no
+        self.fetches: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def fetchval(self, query: str, *args: Any) -> Any:
+        self.fetches.append((query, args))
+        return self.contract_no
+
+    async def execute(self, query: str, *args: Any) -> str:
+        self.executions.append((query, args))
+        if "UPDATE order_items" in query:
+            return "UPDATE 1"
+        if "UPDATE inspection_photo_tasks" in query:
+            return "UPDATE 4"
+        raise AssertionError(f"Unexpected execute: {query} {args}")
+
+
+def test_unassign_webhook_clears_local_assignments_by_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_feishu(monkeypatch)
+    connection = _FakeUnassignConnection()
+
+    async def connect(_: str) -> _FakeUnassignConnection:
+        return connection
+
+    monkeypatch.setattr(bitable_sync.asyncpg, "connect", connect)
+
+    result = asyncio.run(
+        bitable_sync.unassign_order_webhook({"record_id": " rec_order\n"})
+    )
+
+    assert result == {"order_items": 1, "inspection_photo_tasks": 4}
+    assert connection.closed is True
+    assert connection.fetches[0][1] == ("rec_order",)
+    assert len(connection.executions) == 2
+    assert all(args == ("26MT-001",) for _, args in connection.executions)
+    assert "inspector_open_id = NULL" in connection.executions[0][0]
+    assert "feishu_fields = feishu_fields" in connection.executions[0][0]
+    assert "inspector_open_id = NULL" in connection.executions[1][0]
+
+
+def test_unassign_webhook_rejects_unknown_order_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_feishu(monkeypatch)
+    connection = _FakeUnassignConnection(contract_no=None)
+
+    async def connect(_: str) -> _FakeUnassignConnection:
+        return connection
+
+    monkeypatch.setattr(bitable_sync.asyncpg, "connect", connect)
+
+    with pytest.raises(bitable_sync.SyncValidationError, match="No synchronized order"):
+        asyncio.run(
+            bitable_sync.unassign_order_webhook({"record_id": "rec_unknown"})
+        )
+
+    assert connection.executions == []
+    assert connection.closed is True
