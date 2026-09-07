@@ -151,7 +151,7 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             raise LookupError("Task not found")
         tasks = list(await connection.fetch(
             """SELECT t.feishu_record_id, t.product_type, t.specification, t.inspection_stage, t.sequence_no,
-                      EXISTS(SELECT 1 FROM photo_records p WHERE p.task_feishu_record_id = t.feishu_record_id) AS uploaded
+                      t.inspection_status
                FROM inspection_photo_tasks t WHERE t.contract_no = $1 AND t.inspector_open_id = $2
                ORDER BY created_at""",
             selected["contract_no"], user["open_id"],
@@ -170,7 +170,7 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
             "contract_no": selected["contract_no"],
             "tasks": [
                 {"feishu_record_id": task["feishu_record_id"], "product_type": task["product_type"],
-                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "uploaded": {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
+                 "specification": task["specification"], "inspection_stage": task["inspection_stage"], "sequence_no": task["sequence_no"], "uploaded": _is_complete(task["inspection_status"]) and {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}.issubset({photo["inspection_item"] for photo in by_task[str(task["feishu_record_id"])]}),
                  "requirements": [{"name": name, "mandatory": name in _mandatory_items()} for name in _requirements(task["product_type"])], "photos": by_task[str(task["feishu_record_id"])]}
                 for task in tasks
             ],
@@ -180,17 +180,22 @@ async def capture_task(user_id: str, record_id: str) -> dict[str, Any]:
 
 
 def _task_is_complete(task: asyncpg.Record, captured_items: dict[str, set[str]]) -> bool:
+    return _is_complete(task["inspection_status"]) and _has_required_photos(task, captured_items)
+
+
+def _has_required_photos(task: Any, captured_items: dict[str, set[str]]) -> bool:
     mandatory = {name for name in _requirements(task["product_type"]) if name in _mandatory_items()}
     return mandatory.issubset(captured_items.get(str(task["feishu_record_id"]), set()))
 
 
 def _completion_statuses(
-    tasks: list[Any], captured_items: dict[str, set[str]]
+    tasks: list[Any], captured_items: dict[str, set[str]], submitted_task_ids: set[str]
 ) -> tuple[list[str], list[str]]:
     completed_task_ids = [
         str(task["feishu_record_id"])
         for task in tasks
-        if _task_is_complete(task, captured_items)
+        if _has_required_photos(task, captured_items)
+        and (str(task["feishu_record_id"]) in submitted_task_ids or _is_complete(task["inspection_status"]))
     ]
     tasks_by_contract: dict[str, list[str]] = defaultdict(list)
     for task in tasks:
@@ -250,8 +255,12 @@ async def commit_photo_records(
     values: list[dict[str, Any]],
     delete_photo_ids: list[str] | None = None,
     contract_no: str | None = None,
+    mode: str = "complete",
+    submitted_task_ids: list[str] | None = None,
 ) -> PhotoCommitResult:
     """Atomically apply new/deleted photos and queue completed Feishu statuses."""
+    if mode not in {"save", "complete"}:
+        raise ValueError("Invalid submission mode")
     delete_photo_ids = sorted(set(delete_photo_ids or []))
     connection = await asyncpg.connect(_dsn())
     try:
@@ -273,7 +282,7 @@ async def commit_photo_records(
             if contract_no and any(str(row["contract_no"]) != contract_no for row in deleted_rows):
                 raise LookupError("One or more photos do not belong to this contract")
 
-            task_ids = [value["task_id"] for value in values]
+            task_ids = list(submitted_task_ids or []) + [value["task_id"] for value in values]
             task_ids.extend(str(row["task_feishu_record_id"]) for row in deleted_rows)
             tasks = await connection.fetch(
                 """SELECT feishu_record_id, contract_no, sequence_no, specification, product_type
@@ -283,6 +292,8 @@ async def commit_photo_records(
             task_map = {str(task["feishu_record_id"]): task for task in tasks}
             if len(task_map) != len(set(task_ids)):
                 raise LookupError("One or more capture tasks are unavailable")
+            if contract_no and any(str(task["contract_no"]) != contract_no for task in tasks):
+                raise LookupError("Task does not belong to this contract")
             if delete_photo_ids:
                 await connection.execute(
                     "DELETE FROM photo_records WHERE id::text = ANY($1::text[])",
@@ -308,9 +319,11 @@ async def commit_photo_records(
                     value["sha256"], json.dumps(value["metadata"], ensure_ascii=False), value["search_text"],
                 )
                 ids.append(str(record["id"]))
+            if mode == "save":
+                return PhotoCommitResult(ids, [], [(str(row["oss_object_key"]), str(row["preview_oss_object_key"])) for row in deleted_rows])
             contract_numbers = sorted({str(task["contract_no"]) for task in tasks})
             contract_tasks = await connection.fetch(
-                """SELECT feishu_record_id, contract_no, product_type
+                """SELECT feishu_record_id, contract_no, product_type, inspection_status
                    FROM inspection_photo_tasks
                    WHERE contract_no = ANY($1::text[])""",
                 contract_numbers,
@@ -326,7 +339,7 @@ async def commit_photo_records(
             for photo in photo_items:
                 captured_items[str(photo["task_feishu_record_id"])].add(str(photo["inspection_item"]))
 
-            completed_task_ids, completed_contracts = _completion_statuses(contract_tasks, captured_items)
+            completed_task_ids, completed_contracts = _completion_statuses(contract_tasks, captured_items, set(task_ids))
             incomplete_edited_tasks = set(task_ids) - set(completed_task_ids)
             if incomplete_edited_tasks:
                 raise ValueError("编辑后的照片仍有必拍项缺失")

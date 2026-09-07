@@ -1,4 +1,4 @@
-"""Confirmation-only batch upload for locally staged capture drafts."""
+"""Save or complete capture tasks with locally staged photos."""
 
 from __future__ import annotations
 
@@ -111,6 +111,7 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         commit_result = await commit_photo_records(
             str(user_id), prepared, delete_photo_ids=delete_photo_ids,
             contract_no=str(payload["contract_no"]),
+            mode=str(payload["mode"]), submitted_task_ids=payload["task_ids"],
         )
     except (LookupError, ValueError) as exc:
         await _cleanup_uploaded(uploaded)
@@ -125,7 +126,7 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         await _cleanup_uploaded(uploaded)
         raise HTTPException(status_code=500, detail="Photo metadata could not be saved; no photos were saved") from exc
     try:
-        feishu_sync = await sync_pending_statuses(commit_result.sync_job_ids)
+        feishu_sync = await sync_pending_statuses(commit_result.sync_job_ids) if commit_result.sync_job_ids else {"synced": 0, "pending": 0}
     except Exception:
         # Photos and the durable outbox are already committed. Never report an
         # upload failure here, otherwise the client may upload the same batch twice.
@@ -181,6 +182,14 @@ def _manifest(value: str, file_count: int) -> dict[str, object]:
         raise HTTPException(status_code=400, detail="Invalid upload manifest") from exc
     if not isinstance(payload, dict) or not isinstance(payload.get("contract_no"), str) or not isinstance(payload.get("photos"), list):
         raise HTTPException(status_code=400, detail="Invalid upload manifest")
+    mode = payload.get("mode", "complete")
+    task_ids = payload.get("task_ids", [])
+    if mode not in ("save", "complete"):
+        raise HTTPException(status_code=400, detail="Invalid submission mode")
+    if not isinstance(task_ids, list) or any(not isinstance(task_id, str) or not task_id.strip() for task_id in task_ids):
+        raise HTTPException(status_code=400, detail="Invalid task IDs")
+    payload["mode"] = mode
+    payload["task_ids"] = list(dict.fromkeys(task_id.strip() for task_id in task_ids))
     items = payload["photos"]
     delete_photo_ids = payload.get("delete_photo_ids", [])
     if not isinstance(delete_photo_ids, list) or any(not isinstance(photo_id, str) or not photo_id.strip() for photo_id in delete_photo_ids):
@@ -188,7 +197,7 @@ def _manifest(value: str, file_count: int) -> dict[str, object]:
     delete_photo_ids = [photo_id.strip() for photo_id in delete_photo_ids]
     if len(delete_photo_ids) != len(set(delete_photo_ids)):
         raise HTTPException(status_code=400, detail="Duplicate deleted photo IDs")
-    if (not items and not delete_photo_ids) or len(items) != file_count:
+    if (not items and not delete_photo_ids and not (mode == "complete" and task_ids)) or len(items) != file_count:
         raise HTTPException(status_code=400, detail="Every submitted photo must have one file")
     payload["delete_photo_ids"] = delete_photo_ids
     indexes = set()

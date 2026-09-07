@@ -74,13 +74,13 @@ def test_search_tokens_are_bounded() -> None:
 
 def test_completion_statuses_submit_task_before_whole_order() -> None:
     tasks = [
-        {"feishu_record_id": "task-1", "contract_no": "26MT-001", "product_type": "法兰"},
-        {"feishu_record_id": "task-2", "contract_no": "26MT-001", "product_type": "法兰"},
+        {"feishu_record_id": "task-1", "contract_no": "26MT-001", "product_type": "法兰", "inspection_status": "待处理"},
+        {"feishu_record_id": "task-2", "contract_no": "26MT-001", "product_type": "法兰", "inspection_status": "待处理"},
     ]
     mandatory = set(_requirements("法兰")) & _mandatory_items()
     completed_tasks, completed_contracts = _completion_statuses(
         tasks,
-        {"task-1": mandatory},
+        {"task-1": mandatory}, {"task-1"},
     )
     assert completed_tasks == ["task-1"]
     assert completed_contracts == []
@@ -88,13 +88,13 @@ def test_completion_statuses_submit_task_before_whole_order() -> None:
 
 def test_completion_statuses_submit_order_only_when_all_tasks_complete() -> None:
     tasks = [
-        {"feishu_record_id": "task-1", "contract_no": "26MT-001", "product_type": "法兰"},
-        {"feishu_record_id": "task-2", "contract_no": "26MT-001", "product_type": "法兰"},
+        {"feishu_record_id": "task-1", "contract_no": "26MT-001", "product_type": "法兰", "inspection_status": "待处理"},
+        {"feishu_record_id": "task-2", "contract_no": "26MT-001", "product_type": "法兰", "inspection_status": "待处理"},
     ]
     mandatory = set(_requirements("法兰")) & _mandatory_items()
     completed_tasks, completed_contracts = _completion_statuses(
         tasks,
-        {"task-1": mandatory, "task-2": mandatory},
+        {"task-1": mandatory, "task-2": mandatory}, {"task-1", "task-2"},
     )
     assert completed_tasks == ["task-1", "task-2"]
     assert completed_contracts == ["26MT-001"]
