@@ -6,8 +6,6 @@ and is never written to disk.
 
 Run from the backend directory::
 
-    $env:ERP_USERNAME = "AI004"
-    $env:ERP_PASSWORD = "..."
     .venv\Scripts\python.exe scripts\erp_login.py
 
 Validate the saved session later without supplying the password::
@@ -33,9 +31,14 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from app.core.config import settings
+
 DEFAULT_BASE_URL = "https://erp.mtholdinggroup.com/"
 DEFAULT_TOKEN_FILE = Path(__file__).resolve().parents[1] / "data" / "erp_session.json"
 LOGIN_FORM_MARKER = 'id="frmLogin"'
+SESSION_TIMEOUT_MARKER = "rebeeSessionTimeout"
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -76,7 +79,10 @@ def _input_value(html: str, element_id: str) -> str | None:
 
 
 def _looks_authenticated(html: str) -> bool:
-    if LOGIN_FORM_MARKER.lower() in html.lower():
+    if (
+        LOGIN_FORM_MARKER.lower() in html.lower()
+        or SESSION_TIMEOUT_MARKER in html
+    ):
         return False
     return any(marker in html for marker in ("退出", "注销", "logout", "logOut"))
 
@@ -257,8 +263,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url", default=os.getenv("ERP_BASE_URL", DEFAULT_BASE_URL)
     )
-    parser.add_argument("--username", default=os.getenv("ERP_USERNAME"))
-    parser.add_argument("--password", default=os.getenv("ERP_PASSWORD"))
+    parser.add_argument(
+        "--username", default=os.getenv("ERP_USERNAME") or settings.erp_username
+    )
+    parser.add_argument(
+        "--password", default=os.getenv("ERP_PASSWORD") or settings.erp_password
+    )
     parser.add_argument(
         "--token-file",
         type=Path,

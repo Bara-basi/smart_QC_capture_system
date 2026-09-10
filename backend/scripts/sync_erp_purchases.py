@@ -48,6 +48,7 @@ from scripts.erp_login import (
     DEFAULT_TOKEN_FILE,
     AuthenticationResult,
     ErpAuthenticationError,
+    SESSION_TIMEOUT_MARKER,
     _cookies_from_client,
     _primary_token,
     authenticated_client_from_file,
@@ -57,6 +58,7 @@ from scripts.erp_login import (
 
 ERP_LIST_PATH = "purchase_selectPur"
 ERP_DETAIL_PATH = "purchaseItems_selectByPurchaseId"
+ERP_PRODUCTION_DAILY_PATH = "productionDaily_listDataByPurchaseId"
 ERP_LIST_REFERER = "purchase_goOutList?menuCode=80400"
 ERP_PAGE_SIZE = 100
 FEISHU_API = "https://open.feishu.cn/open-apis"
@@ -71,8 +73,23 @@ ORDER_CODE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-ORDER_FIELDS = {"合同号", "产品类型", "质检状态", "工厂"}
+ORDER_FIELDS = {
+    "合同号",
+    "产品类型",
+    "质检状态",
+    "订单状态",
+    "工厂",
+    "睿贝质检员",
+    "生产内容",
+    "生产日报创建时间",
+}
 TASK_FIELDS = {"合同号", "序号", "产品类型", "规格", "数量", "质检阶段"}
+ORDER_METADATA_FIELD_TYPES = {
+    "睿贝质检员": 1,
+    "生产内容": 1,
+    "生产日报创建时间": 5,
+}
+UNTRACKED_ORDER_STATUSES = {"已完成", "测试订单"}
 
 
 class ErpProtocolError(RuntimeError):
@@ -89,6 +106,15 @@ class PurchaseSummary:
     purchase_code: str
     purchase_date: str
     order_status: str
+    supplier: str
+    inspector: str
+    production_schedule: str
+
+
+@dataclass(frozen=True)
+class ProductionDaily:
+    content: str
+    created_at: str
 
 
 @dataclass(frozen=True)
@@ -116,6 +142,10 @@ class PurchaseOrder:
     order_status: str
     product_types: str
     tasks: list[ProductTask]
+    supplier: str = ""
+    inspector: str = ""
+    production_content: str = ""
+    production_daily_created_at: str = ""
 
 
 def _first(values: Any) -> str:
@@ -253,6 +283,13 @@ def parse_purchase_list(payload: dict[str, Any]) -> tuple[list[PurchaseSummary],
                     columns.get("purchase_date", {}).get("columnValues")
                 ),
                 order_status=_first(columns.get("status", {}).get("columnValues")),
+                supplier=_first(columns.get("com_id", {}).get("columnValues")),
+                inspector=_first(
+                    columns.get("merchandiser", {}).get("columnValues")
+                ),
+                production_schedule=_first(
+                    columns.get("production_schedule", {}).get("columnValues")
+                ),
             )
         )
     return purchases, total
@@ -273,7 +310,9 @@ def _parse_nonstandard_root(response_text: str) -> list[Any]:
 
 
 def parse_purchase_detail(
-    summary: PurchaseSummary, response_text: str
+    summary: PurchaseSummary,
+    response_text: str,
+    production_daily: ProductionDaily | None = None,
 ) -> PurchaseOrder:
     tasks: list[ProductTask] = []
     for row_number, row in enumerate(_parse_nonstandard_root(response_text), start=1):
@@ -314,7 +353,34 @@ def parse_purchase_detail(
         order_status=summary.order_status,
         product_types=product_types,
         tasks=tasks,
+        supplier=summary.supplier,
+        inspector=summary.inspector,
+        production_content=production_daily.content if production_daily else "",
+        production_daily_created_at=(
+            production_daily.created_at if production_daily else ""
+        ),
     )
+
+
+def parse_production_daily(
+    purchase_code: str, response_text: str
+) -> ProductionDaily | None:
+    rows = _parse_nonstandard_root(response_text)
+    entries: list[ProductionDaily] = []
+    for row in rows:
+        columns = _column_map(row)
+        content = _first(columns.get("content", {}).get("columnValues"))
+        created_at = _first(columns.get("on_create", {}).get("columnValues"))
+        if content or created_at:
+            entries.append(ProductionDaily(content=content, created_at=created_at))
+    if not entries:
+        return None
+    latest = max(entries, key=lambda entry: entry.created_at)
+    if not latest.created_at:
+        raise ErpProtocolError(
+            f"ERP production daily for {purchase_code} has no creation time"
+        )
+    return latest
 
 
 class ErpPurchaseClient:
@@ -342,6 +408,12 @@ class ErpPurchaseClient:
     def _configure_client(self, client: httpx.Client) -> httpx.Client:
         client.cookies.set(
             "purchase_business_list",
+            str(ERP_PAGE_SIZE),
+            domain=urlparse(self.base_url).hostname,
+            path="/",
+        )
+        client.cookies.set(
+            "productionDaily_page",
             str(ERP_PAGE_SIZE),
             domain=urlparse(self.base_url).hostname,
             path="/",
@@ -399,6 +471,7 @@ class ErpPurchaseClient:
         return (
             response.status_code in {401, 403}
             or b'id="frmLogin"' in response.content
+            or SESSION_TIMEOUT_MARKER.encode() in response.content
             or b"top.location.href = '/'" in response.content
         )
 
@@ -425,7 +498,12 @@ class ErpPurchaseClient:
                     self._client = self._login_again()
         raise ErpAuthenticationError("ERP rejected the saved session after renewal")
 
-    def purchase_summaries(self) -> list[PurchaseSummary]:
+    def purchase_summaries(
+        self,
+        *,
+        condition: str = "uncompleted",
+        search_value: str = "",
+    ) -> list[PurchaseSummary]:
         referer = urljoin(self.base_url, ERP_LIST_REFERER)
 
         def fetch_page(page: int) -> tuple[list[PurchaseSummary], int]:
@@ -434,9 +512,9 @@ class ErpPurchaseClient:
                 ERP_LIST_PATH,
                 data={
                     "p": str(page),
-                    "condition": "uncompleted",
+                    "condition": condition,
                     "userDefaultTableName": "biz_purchases",
-                    "searchValue": "",
+                    "searchValue": search_value,
                 },
                 headers={"Referer": referer},
             )
@@ -464,7 +542,22 @@ class ErpPurchaseClient:
             )
         return list(unique.values())
 
-    def purchase_detail(self, summary: PurchaseSummary) -> PurchaseOrder:
+    def completed_purchase_by_code(
+        self, purchase_code: str
+    ) -> PurchaseSummary | None:
+        matches = self.purchase_summaries(
+            condition="completed", search_value=purchase_code
+        )
+        return next(
+            (item for item in matches if item.purchase_code == purchase_code),
+            None,
+        )
+
+    def purchase_detail(
+        self,
+        summary: PurchaseSummary,
+        production_daily: ProductionDaily | None = None,
+    ) -> PurchaseOrder:
         referer_path = (
             "purchase_toUpdate?openWindow=Y&type=view&id=" + summary.purchase_id
         )
@@ -480,7 +573,35 @@ class ErpPurchaseClient:
             headers={"Referer": urljoin(self.base_url, referer_path)},
         )
         return parse_purchase_detail(
-            summary, response.content.decode("utf-8", errors="strict")
+            summary,
+            response.content.decode("utf-8", errors="strict"),
+            production_daily,
+        )
+
+    def production_daily(self, summary: PurchaseSummary) -> ProductionDaily | None:
+        if summary.production_schedule in {"", "/", "查看生产日志"}:
+            return None
+        response = self.request(
+            "POST",
+            ERP_PRODUCTION_DAILY_PATH,
+            data={
+                "p": "1",
+                "purchase_id": summary.purchase_id,
+                "produceId": "",
+                "orderId": "",
+                "searchValue": "",
+            },
+            headers={
+                "Referer": urljoin(
+                    self.base_url,
+                    "productionDaily_goProductionDaily?openWindow=Y&purchase_id="
+                    + summary.purchase_id,
+                )
+            },
+        )
+        return parse_production_daily(
+            summary.purchase_code,
+            response.content.decode("utf-8", errors="strict"),
         )
 
 
@@ -600,8 +721,41 @@ class FeishuPurchaseSyncClient:
         _check_feishu_response(response, "create 采购时间 field")
         return "采购时间"
 
+    def ensure_order_metadata_fields(self, *, create_if_missing: bool) -> None:
+        table_id = settings.feishu_bitable_order_table_id
+        fields = self.fields(table_id)
+        for field_name, field_type in ORDER_METADATA_FIELD_TYPES.items():
+            existing = fields.get(field_name)
+            if existing:
+                if existing.get("type") != field_type:
+                    raise FeishuSyncError(
+                        f"Feishu {field_name} field has type {existing.get('type')}, "
+                        f"expected {field_type}"
+                    )
+                continue
+            if not create_if_missing:
+                raise FeishuSyncError(
+                    f"Order table needs a writable {field_name} field. "
+                    "Rerun with --ensure-schema to create it."
+                )
+            body: dict[str, Any] = {
+                "field_name": field_name,
+                "type": field_type,
+            }
+            if field_type == 5:
+                body["property"] = {"date_formatter": "yyyy-MM-dd"}
+            response = self.client.post(
+                f"{FEISHU_API}/bitable/v1/apps/"
+                f"{settings.feishu_bitable_app_token}/tables/{table_id}/fields",
+                headers=self.headers,
+                json=body,
+            )
+            self.request_count += 1
+            _check_feishu_response(response, f"create {field_name} field")
+
     def validate_fields(self) -> None:
-        order_names = set(self.fields(settings.feishu_bitable_order_table_id))
+        order_fields = self.fields(settings.feishu_bitable_order_table_id)
+        order_names = set(order_fields)
         task_names = set(self.fields(settings.feishu_bitable_table_id))
         missing_order = ORDER_FIELDS - order_names
         missing_task = TASK_FIELDS - task_names
@@ -609,6 +763,20 @@ class FeishuPurchaseSyncClient:
             raise FeishuSyncError(
                 "Missing Bitable fields: "
                 f"order={sorted(missing_order)}, task={sorted(missing_task)}"
+            )
+        tracking_field = order_fields["订单状态"]
+        tracking_options = {
+            str(option.get("name"))
+            for option in (tracking_field.get("property") or {}).get("options", [])
+        }
+        if tracking_field.get("type") != 3 or not {
+            "执行中",
+            "已完成",
+            "测试订单",
+        }.issubset(tracking_options):
+            raise FeishuSyncError(
+                "Feishu 订单状态 must be a SingleSelect field with "
+                "执行中, 已完成, and 测试订单 options"
             )
 
     def iter_records(
@@ -652,6 +820,17 @@ class FeishuPurchaseSyncClient:
 
     def existing_orders(self) -> list[dict[str, Any]]:
         return self.iter_records(settings.feishu_bitable_order_table_id)
+
+    def tracked_orders(
+        self, records: list[dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
+        records = self.existing_orders() if records is None else records
+        return [
+            record
+            for record in records
+            if _field_text((record.get("fields") or {}).get("订单状态"))
+            not in UNTRACKED_ORDER_STATUSES
+        ]
 
     def existing_tasks(self) -> list[dict[str, Any]]:
         return self.iter_records(settings.feishu_bitable_table_id)
@@ -728,14 +907,70 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
             temporary.unlink()
 
 
+def crawl_production_dailies(
+    erp: ErpPurchaseClient,
+    summaries: list[PurchaseSummary],
+    *,
+    detail_workers: int,
+) -> dict[str, ProductionDaily]:
+    candidates = [
+        summary
+        for summary in summaries
+        if summary.production_schedule not in {"", "/", "查看生产日志"}
+    ]
+    result: dict[str, ProductionDaily] = {}
+    if not candidates:
+        return result
+    with ThreadPoolExecutor(max_workers=max(1, detail_workers)) as executor:
+        daily_results = executor.map(erp.production_daily, candidates)
+        for summary, daily in zip(candidates, daily_results, strict=True):
+            if daily is not None:
+                result[summary.purchase_code] = daily
+    print(
+        f"ERP production dailies={len(result)}/"
+        f"{len(candidates)} orders with log links"
+    )
+    return result
+
+
+def find_completed_orders(
+    erp: ErpPurchaseClient,
+    purchase_codes: set[str],
+    *,
+    detail_workers: int,
+) -> list[PurchaseSummary]:
+    codes = sorted(purchase_codes)
+    if not codes:
+        return []
+    completed: list[PurchaseSummary] = []
+    with ThreadPoolExecutor(max_workers=max(1, detail_workers)) as executor:
+        matches = executor.map(erp.completed_purchase_by_code, codes)
+        for match in matches:
+            if match is not None:
+                completed.append(match)
+    print(
+        f"ERP completed lookups={len(codes)}, exact_matches={len(completed)}, "
+        f"not_found={len(codes) - len(completed)}"
+    )
+    return completed
+
+
 def crawl_new_orders(
     erp: ErpPurchaseClient,
     existing_contracts: set[str],
     *,
     limit: int | None,
     detail_workers: int,
-) -> tuple[list[PurchaseOrder], list[PurchaseSummary], int]:
+) -> tuple[
+    list[PurchaseOrder],
+    list[PurchaseSummary],
+    dict[str, ProductionDaily],
+    int,
+]:
     summaries = erp.purchase_summaries()
+    production_dailies = crawl_production_dailies(
+        erp, summaries, detail_workers=detail_workers
+    )
     new_summaries = [
         summary
         for summary in summaries
@@ -749,14 +984,16 @@ def crawl_new_orders(
     )
 
     if not new_summaries:
-        return [], summaries, 0
+        return [], summaries, production_dailies, 0
 
     completed = 0
     completed_lock = threading.Lock()
 
     def fetch(summary: PurchaseSummary) -> PurchaseOrder:
         nonlocal completed
-        order = erp.purchase_detail(summary)
+        order = erp.purchase_detail(
+            summary, production_dailies.get(summary.purchase_code)
+        )
         with completed_lock:
             completed += 1
             if completed == 1 or completed % 10 == 0 or completed == len(new_summaries):
@@ -768,7 +1005,7 @@ def crawl_new_orders(
 
     with ThreadPoolExecutor(max_workers=max(1, detail_workers)) as executor:
         orders = list(executor.map(fetch, new_summaries))
-    return orders, summaries, len(new_summaries)
+    return orders, summaries, production_dailies, len(new_summaries)
 
 
 def _task_write_plan(
@@ -834,7 +1071,67 @@ def _factory_backfill_plan(
     return updates
 
 
-def _order_create_records(orders: list[PurchaseOrder], purchase_date_field: str) -> list[dict[str, Any]]:
+def _order_metadata_fields(
+    supplier: str,
+    inspector: str,
+    production_daily: ProductionDaily | None,
+) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    if supplier:
+        fields["工厂"] = supplier
+    if inspector:
+        fields["睿贝质检员"] = inspector
+    if production_daily:
+        fields["生产内容"] = production_daily.content
+        fields["生产日报创建时间"] = _purchase_date_timestamp(
+            production_daily.created_at
+        )
+    return fields
+
+
+def _order_metadata_update_plan(
+    existing_records: list[dict[str, Any]],
+    summaries: list[PurchaseSummary],
+    production_dailies: dict[str, ProductionDaily],
+    tracking_statuses: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    tracking_statuses = tracking_statuses or {}
+    by_contract = {
+        _field_text((record.get("fields") or {}).get("合同号")): record
+        for record in existing_records
+        if _field_text((record.get("fields") or {}).get("合同号"))
+    }
+    updates: list[dict[str, Any]] = []
+    for summary in summaries:
+        record = by_contract.get(summary.purchase_code)
+        if not record:
+            continue
+        current = record.get("fields") or {}
+        targets = _order_metadata_fields(
+            summary.supplier,
+            summary.inspector,
+            production_dailies.get(summary.purchase_code),
+        )
+        tracking_status = tracking_statuses.get(summary.purchase_code)
+        if tracking_status:
+            targets["订单状态"] = tracking_status
+        changed: dict[str, Any] = {}
+        for field_name, target in targets.items():
+            current_value = current.get(field_name)
+            if isinstance(target, str):
+                if _field_text(current_value) != target:
+                    changed[field_name] = target
+            elif current_value != target:
+                changed[field_name] = target
+        record_id = _field_text(record.get("record_id"))
+        if record_id and changed:
+            updates.append({"record_id": record_id, "fields": changed})
+    return updates
+
+
+def _order_create_records(
+    orders: list[PurchaseOrder], purchase_date_field: str
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for order in orders:
         fields: dict[str, Any] = {
@@ -842,10 +1139,21 @@ def _order_create_records(orders: list[PurchaseOrder], purchase_date_field: str)
             purchase_date_field: _purchase_date_timestamp(order.purchase_date),
             "产品类型": order.product_types,
             "质检状态": "待分配",
+            "订单状态": "执行中",
         }
-        factory = factory_name(order.purchase_code)
-        if factory:
-            fields["工厂"] = factory
+        production_daily = None
+        if order.production_content or order.production_daily_created_at:
+            production_daily = ProductionDaily(
+                content=order.production_content,
+                created_at=order.production_daily_created_at,
+            )
+        fields.update(
+            _order_metadata_fields(
+                order.supplier,
+                order.inspector,
+                production_daily,
+            )
+        )
         records.append({"fields": fields})
     return records
 
@@ -862,13 +1170,29 @@ def _bitable_sequence(sequence: str) -> float | str:
 def sync_to_feishu(
     feishu: FeishuPurchaseSyncClient,
     orders: list[PurchaseOrder],
+    summaries: list[PurchaseSummary],
+    production_dailies: dict[str, ProductionDaily],
+    completed_summaries: list[PurchaseSummary],
+    existing_orders: list[dict[str, Any]],
     active_stages: dict[str, str],
     *,
     ensure_schema: bool,
-) -> tuple[int, int, int]:
+) -> tuple[int, int, int, int]:
+    feishu.ensure_order_metadata_fields(create_if_missing=ensure_schema)
     feishu.validate_fields()
     task_records, task_updates = _task_write_plan(
         feishu.existing_tasks(), orders, active_stages
+    )
+    tracked_summaries = [*summaries, *completed_summaries]
+    tracking_statuses = {
+        **{summary.purchase_code: "执行中" for summary in summaries},
+        **{summary.purchase_code: "已完成" for summary in completed_summaries},
+    }
+    order_updates = _order_metadata_update_plan(
+        existing_orders,
+        tracked_summaries,
+        production_dailies,
+        tracking_statuses,
     )
     purchase_date_field = (
         feishu.ensure_purchase_date_field(create_if_missing=ensure_schema)
@@ -891,12 +1215,17 @@ def sync_to_feishu(
         task_updates,
         label="inspection task stages",
     )
+    updated_orders = feishu.batch_update(
+        settings.feishu_bitable_order_table_id,
+        order_updates,
+        label="order ERP metadata",
+    )
     created_orders = feishu.batch_create(
         settings.feishu_bitable_order_table_id,
         order_records,
         label="orders",
     )
-    return created_orders, created_tasks, updated_tasks
+    return created_orders, created_tasks, updated_tasks, updated_orders
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -906,8 +1235,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--base-url", default=os.getenv("ERP_BASE_URL", DEFAULT_BASE_URL)
     )
-    parser.add_argument("--username", default=os.getenv("ERP_USERNAME"))
-    parser.add_argument("--password", default=os.getenv("ERP_PASSWORD"))
+    parser.add_argument(
+        "--username", default=os.getenv("ERP_USERNAME") or settings.erp_username
+    )
+    parser.add_argument(
+        "--password", default=os.getenv("ERP_PASSWORD") or settings.erp_password
+    )
     parser.add_argument(
         "--token-file",
         type=Path,
@@ -973,7 +1306,28 @@ def main() -> int:
                 f"Feishu requests={feishu.request_count}"
             )
             return 0
-        existing_contracts = feishu.existing_contracts()
+        feishu.ensure_order_metadata_fields(create_if_missing=args.ensure_schema)
+        feishu.validate_fields()
+        all_order_records = feishu.existing_orders()
+        tracked_order_records = feishu.tracked_orders(all_order_records)
+        existing_contracts = {
+            contract
+            for record in all_order_records
+            if (
+                contract := _field_text(
+                    (record.get("fields") or {}).get("合同号")
+                )
+            )
+        }
+        tracked_contracts = {
+            contract
+            for record in tracked_order_records
+            if (
+                contract := _field_text(
+                    (record.get("fields") or {}).get("合同号")
+                )
+            )
+        }
         erp = ErpPurchaseClient(
             base_url=args.base_url,
             token_file=args.token_file,
@@ -981,17 +1335,58 @@ def main() -> int:
             password=password,
             timeout=args.timeout,
         )
-        orders, summaries, selected_count = crawl_new_orders(
+        orders, summaries, production_dailies, selected_count = crawl_new_orders(
             erp,
             existing_contracts,
             limit=args.limit,
             detail_workers=args.detail_workers,
+        )
+        active_contracts = {summary.purchase_code for summary in summaries}
+        missing_from_active = tracked_contracts - active_contracts
+        completed_summaries = find_completed_orders(
+            erp,
+            missing_from_active,
+            detail_workers=args.detail_workers,
+        )
+        completed_production_dailies = crawl_production_dailies(
+            erp,
+            completed_summaries,
+            detail_workers=args.detail_workers,
+        )
+        production_dailies.update(completed_production_dailies)
+        completed_contracts = {
+            summary.purchase_code for summary in completed_summaries
+        }
+        completed_not_found = sorted(
+            missing_from_active - completed_contracts
+        )
+        tracking_statuses = {
+            **{summary.purchase_code: "执行中" for summary in summaries},
+            **{
+                summary.purchase_code: "已完成"
+                for summary in completed_summaries
+            },
+        }
+        planned_order_updates = _order_metadata_update_plan(
+            tracked_order_records,
+            [*summaries, *completed_summaries],
+            production_dailies,
+            tracking_statuses,
         )
         snapshot = {
             "schema_version": 1,
             "captured_at": datetime.now(SHANGHAI).isoformat(),
             "erp_active_order_count": len(summaries),
             "selected_new_order_count": selected_count,
+            "production_daily_count": len(production_dailies),
+            "tracked_feishu_order_count": len(tracked_contracts),
+            "missing_from_active_count": len(missing_from_active),
+            "completed_order_match_count": len(completed_summaries),
+            "completed_not_found": completed_not_found,
+            "planned_order_update_count": len(planned_order_updates),
+            "completed_orders": [
+                asdict(summary) for summary in completed_summaries
+            ],
             "orders": [asdict(order) for order in orders],
         }
         _atomic_json_write(args.snapshot_file, snapshot)
@@ -1003,7 +1398,8 @@ def main() -> int:
 
         if args.dry_run:
             print(
-                f"Dry run complete: ERP requests={erp.request_count}, "
+                f"Dry run complete: planned_order_updates="
+                f"{len(planned_order_updates)}, ERP requests={erp.request_count}, "
                 f"Feishu read requests={feishu.request_count}"
             )
             return 0
@@ -1013,15 +1409,20 @@ def main() -> int:
             for summary in summaries
             if summary.order_status
         }
-        created_orders, created_tasks, updated_tasks = sync_to_feishu(
+        created_orders, created_tasks, updated_tasks, updated_orders = sync_to_feishu(
             feishu,
             orders,
+            summaries,
+            production_dailies,
+            completed_summaries,
+            tracked_order_records,
             active_stages,
             ensure_schema=args.ensure_schema,
         )
         print(
             f"Sync complete: created_orders={created_orders}, "
             f"created_tasks={created_tasks}, updated_task_stages={updated_tasks}, "
+            f"updated_order_metadata={updated_orders}, "
             f"ERP requests={erp.request_count}, "
             f"Feishu requests={feishu.request_count}"
         )

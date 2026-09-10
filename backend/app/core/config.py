@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     feishu_bitable_inspection_task_status_field_id: str = ""
     feishu_status_sync_interval_seconds: int = 60
     feishu_sync_webhook_secret: str = ""
+    erp_username: str = ""
+    erp_password: str = ""
     oss_endpoint: str = ""
     oss_bucket: str = ""
     oss_preview_bucket: str = "smart-qc-capture-system-preview-images"

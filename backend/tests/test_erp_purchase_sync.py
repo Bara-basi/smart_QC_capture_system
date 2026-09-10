@@ -2,11 +2,15 @@ from pathlib import PurePosixPath
 
 import pytest
 from scripts.sync_erp_purchases import (
+    FeishuPurchaseSyncClient,
     ProductTask,
+    ProductionDaily,
     PurchaseOrder,
+    PurchaseSummary,
     _default_factory_mapping_candidates,
     _factory_backfill_plan,
     _order_create_records,
+    _order_metadata_update_plan,
     _task_write_plan,
     factory_name,
 )
@@ -135,11 +139,82 @@ def test_factory_backfill_only_fills_empty_cells() -> None:
     assert _factory_backfill_plan(records) == [{"record_id": "rec-1", "fields": {"工厂": "鸿迪"}}]
 
 
-def test_new_order_includes_factory_only_when_mapping_is_confident() -> None:
-    mapped = PurchaseOrder(**{**_order().__dict__, "purchase_code": "26MT-03R411-HD"})
-    unknown = PurchaseOrder(**{**_order().__dict__, "purchase_code": "26MT-10E285-XL"})
+def test_new_order_uses_erp_supplier_instead_of_contract_mapping() -> None:
+    mapped = PurchaseOrder(
+        **{
+            **_order().__dict__,
+            "purchase_code": "26MT-03R411-HD",
+            "supplier": "ERP供应商",
+        }
+    )
+    unknown = PurchaseOrder(
+        **{**_order().__dict__, "purchase_code": "26MT-10E285-XL", "supplier": ""}
+    )
 
     records = _order_create_records([mapped, unknown], "采购时间")
 
-    assert records[0]["fields"]["工厂"] == "鸿迪"
+    assert records[0]["fields"]["工厂"] == "ERP供应商"
     assert "工厂" not in records[1]["fields"]
+
+
+def test_existing_order_metadata_is_updated_from_erp() -> None:
+    existing = [
+        {
+            "record_id": "rec-1",
+            "fields": {
+                "合同号": "26MT-03R411-HD",
+                "工厂": "合同号推导值",
+                "睿贝质检员": "",
+            },
+        }
+    ]
+    summaries = [
+        PurchaseSummary(
+            purchase_id="123",
+            purchase_code="26MT-03R411-HD",
+            purchase_date="2026-09-01",
+            order_status="采购已下单",
+            supplier="浙江鸿迪管业有限公司",
+            inspector="梅正江",
+            production_schedule="2026-09-07/订料中",
+        )
+    ]
+
+    updates = _order_metadata_update_plan(
+        existing,
+        summaries,
+        {
+            "26MT-03R411-HD": ProductionDaily(
+                content="订料中", created_at="2026-09-07"
+            )
+        },
+        {"26MT-03R411-HD": "已完成"},
+    )
+
+    assert updates == [
+        {
+            "record_id": "rec-1",
+            "fields": {
+                "工厂": "浙江鸿迪管业有限公司",
+                "睿贝质检员": "梅正江",
+                "生产内容": "订料中",
+                "生产日报创建时间": 1788710400000,
+                "订单状态": "已完成",
+            },
+        }
+    ]
+
+
+def test_completed_orders_are_excluded_from_tracking() -> None:
+    client = object.__new__(FeishuPurchaseSyncClient)
+    records = [
+        {"record_id": "active", "fields": {"订单状态": "执行中"}},
+        {"record_id": "legacy", "fields": {}},
+        {"record_id": "done", "fields": {"订单状态": "已完成"}},
+        {"record_id": "test", "fields": {"订单状态": "测试订单"}},
+    ]
+
+    assert [record["record_id"] for record in client.tracked_orders(records)] == [
+        "active",
+        "legacy",
+    ]
