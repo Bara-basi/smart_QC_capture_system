@@ -82,12 +82,14 @@ ORDER_FIELDS = {
     "睿贝质检员",
     "生产内容",
     "生产日报创建时间",
+    "工厂交期",
 }
 TASK_FIELDS = {"合同号", "序号", "产品类型", "规格", "数量", "质检阶段"}
 ORDER_METADATA_FIELD_TYPES = {
     "睿贝质检员": 1,
     "生产内容": 1,
     "生产日报创建时间": 5,
+    "工厂交期": 5,
 }
 UNTRACKED_ORDER_STATUSES = {"已完成", "测试订单"}
 
@@ -109,6 +111,7 @@ class PurchaseSummary:
     supplier: str
     inspector: str
     production_schedule: str
+    factory_delivery_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -146,6 +149,7 @@ class PurchaseOrder:
     inspector: str = ""
     production_content: str = ""
     production_daily_created_at: str = ""
+    factory_delivery_date: str = ""
 
 
 def _first(values: Any) -> str:
@@ -290,6 +294,9 @@ def parse_purchase_list(payload: dict[str, Any]) -> tuple[list[PurchaseSummary],
                 production_schedule=_first(
                     columns.get("production_schedule", {}).get("columnValues")
                 ),
+                factory_delivery_date=_first(
+                    columns.get("delivery_date", {}).get("columnValues")
+                ),
             )
         )
     return purchases, total
@@ -359,6 +366,7 @@ def parse_purchase_detail(
         production_daily_created_at=(
             production_daily.created_at if production_daily else ""
         ),
+        factory_delivery_date=summary.factory_delivery_date,
     )
 
 
@@ -1075,6 +1083,7 @@ def _order_metadata_fields(
     supplier: str,
     inspector: str,
     production_daily: ProductionDaily | None,
+    factory_delivery_date: str = "",
 ) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     if supplier:
@@ -1086,6 +1095,8 @@ def _order_metadata_fields(
         fields["生产日报创建时间"] = _purchase_date_timestamp(
             production_daily.created_at
         )
+    if factory_delivery_date:
+        fields["工厂交期"] = _purchase_date_timestamp(factory_delivery_date)
     return fields
 
 
@@ -1111,6 +1122,7 @@ def _order_metadata_update_plan(
             summary.supplier,
             summary.inspector,
             production_dailies.get(summary.purchase_code),
+            summary.factory_delivery_date,
         )
         tracking_status = tracking_statuses.get(summary.purchase_code)
         if tracking_status:
@@ -1152,6 +1164,7 @@ def _order_create_records(
                 order.supplier,
                 order.inspector,
                 production_daily,
+                order.factory_delivery_date,
             )
         )
         records.append({"fields": fields})

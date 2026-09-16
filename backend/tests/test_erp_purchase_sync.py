@@ -177,6 +177,7 @@ def test_existing_order_metadata_is_updated_from_erp() -> None:
             supplier="浙江鸿迪管业有限公司",
             inspector="梅正江",
             production_schedule="2026-09-07/订料中",
+            factory_delivery_date="2026-09-20",
         )
     ]
 
@@ -199,6 +200,7 @@ def test_existing_order_metadata_is_updated_from_erp() -> None:
                 "睿贝质检员": "梅正江",
                 "生产内容": "订料中",
                 "生产日报创建时间": 1788710400000,
+                "工厂交期": 1789833600000,
                 "订单状态": "已完成",
             },
         }
