@@ -12,3 +12,8 @@ docs/      接口、数据模型和部署说明
 ```
 
 开始前请复制 `backend/.env.example` 为 `backend/.env`，并按 `docs/configuration.md` 填入配置。依赖和部署步骤见 `docs/setup.md`。
+
+# 服务器重启指令
+```
+docker compose --env-file .env.ip  -f docker-compose.production.yml -f docker-compose.build-proxy.yml -f docker-compose.ip.yml  up -d --build api caddy
+```

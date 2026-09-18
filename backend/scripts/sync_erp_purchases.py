@@ -118,6 +118,7 @@ class PurchaseSummary:
 class ProductionDaily:
     content: str
     created_at: str
+    record_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -377,13 +378,27 @@ def parse_production_daily(
     entries: list[ProductionDaily] = []
     for row in rows:
         columns = _column_map(row)
+        record_id = _first(columns.get("chk", {}).get("columnValues"))
         content = _first(columns.get("content", {}).get("columnValues"))
         created_at = _first(columns.get("on_create", {}).get("columnValues"))
         if content or created_at:
-            entries.append(ProductionDaily(content=content, created_at=created_at))
+            entries.append(
+                ProductionDaily(
+                    content=content,
+                    created_at=created_at,
+                    record_id=record_id,
+                )
+            )
     if not entries:
         return None
-    latest = max(entries, key=lambda entry: entry.created_at)
+    latest = max(
+        entries,
+        key=lambda entry: (
+            entry.created_at,
+            int(entry.record_id) if entry.record_id.isdigit() else -1,
+            entry.record_id,
+        ),
+    )
     if not latest.created_at:
         raise ErpProtocolError(
             f"ERP production daily for {purchase_code} has no creation time"
@@ -587,29 +602,37 @@ class ErpPurchaseClient:
         )
 
     def production_daily(self, summary: PurchaseSummary) -> ProductionDaily | None:
-        if summary.production_schedule in {"", "/", "查看生产日志"}:
-            return None
-        response = self.request(
-            "POST",
-            ERP_PRODUCTION_DAILY_PATH,
-            data={
-                "p": "1",
-                "purchase_id": summary.purchase_id,
-                "produceId": "",
-                "orderId": "",
-                "searchValue": "",
-            },
-            headers={
-                "Referer": urljoin(
-                    self.base_url,
-                    "productionDaily_goProductionDaily?openWindow=Y&purchase_id="
-                    + summary.purchase_id,
-                )
-            },
+        referer = urljoin(
+            self.base_url,
+            "productionDaily_goProductionDaily?openWindow=Y&purchase_id="
+            + summary.purchase_id,
         )
+
+        def fetch_page(page: int) -> str:
+            response = self.request(
+                "POST",
+                ERP_PRODUCTION_DAILY_PATH,
+                data={
+                    "p": str(page),
+                    "purchase_id": summary.purchase_id,
+                    "produceId": "",
+                    "orderId": "",
+                    "searchValue": "",
+                },
+                headers={"Referer": referer},
+            )
+            return response.content.decode("utf-8", errors="strict")
+
+        response_text = fetch_page(1)
+        total_match = re.search(r"(?:^|[,{])\s*total\s*:\s*(\d+)", response_text)
+        total = int(total_match.group(1)) if total_match else 0
+        roots = _parse_nonstandard_root(response_text)
+        for page in range(2, max(1, math.ceil(total / ERP_PAGE_SIZE)) + 1):
+            roots.extend(_parse_nonstandard_root(fetch_page(page)))
+        combined_response = "{root:" + json.dumps(roots, ensure_ascii=False) + "}"
         return parse_production_daily(
             summary.purchase_code,
-            response.content.decode("utf-8", errors="strict"),
+            combined_response,
         )
 
 
@@ -921,11 +944,10 @@ def crawl_production_dailies(
     *,
     detail_workers: int,
 ) -> dict[str, ProductionDaily]:
-    candidates = [
-        summary
-        for summary in summaries
-        if summary.production_schedule not in {"", "/", "查看生产日志"}
-    ]
+    # The purchase-list production_schedule column depends on the ERP user's
+    # current column configuration and may be absent even when daily records
+    # exist. Query every tracked order so new reports always overwrite Feishu.
+    candidates = list(summaries)
     result: dict[str, ProductionDaily] = {}
     if not candidates:
         return result
@@ -935,8 +957,8 @@ def crawl_production_dailies(
             if daily is not None:
                 result[summary.purchase_code] = daily
     print(
-        f"ERP production dailies={len(result)}/"
-        f"{len(candidates)} orders with log links"
+        f"ERP production dailies found={len(result)}/"
+        f"{len(candidates)} tracked orders queried"
     )
     return result
 

@@ -1,3 +1,4 @@
+import json
 from pathlib import PurePosixPath
 
 import pytest
@@ -13,6 +14,7 @@ from scripts.sync_erp_purchases import (
     _order_metadata_update_plan,
     _task_write_plan,
     factory_name,
+    parse_production_daily,
 )
 
 
@@ -220,3 +222,25 @@ def test_completed_orders_are_excluded_from_tracking() -> None:
         "active",
         "legacy",
     ]
+
+
+def test_production_daily_uses_latest_date_and_record_id() -> None:
+    def row(record_id: str, content: str, created_at: str) -> list[dict[str, object]]:
+        return [
+            {"columnName": "chk", "columnValues": [record_id]},
+            {"columnName": "content", "columnValues": [content]},
+            {"columnName": "on_create", "columnValues": [created_at]},
+        ]
+
+    rows = [
+        row("4200", "旧日报", "2026-09-17"),
+        row("4307", "当天较早日报", "2026-09-18"),
+        row("4310", "当天最新日报", "2026-09-18"),
+    ]
+    response = "{total:3,root:" + json.dumps(rows, ensure_ascii=False) + "}"
+
+    assert parse_production_daily("26MT-TEST", response) == ProductionDaily(
+        content="当天最新日报",
+        created_at="2026-09-18",
+        record_id="4310",
+    )
