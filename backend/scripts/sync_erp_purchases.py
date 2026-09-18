@@ -29,7 +29,7 @@ import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -50,6 +50,7 @@ from scripts.erp_login import (
     ErpAuthenticationError,
     SESSION_TIMEOUT_MARKER,
     _cookies_from_client,
+    _input_value,
     _primary_token,
     authenticated_client_from_file,
     login,
@@ -576,6 +577,13 @@ class ErpPurchaseClient:
             None,
         )
 
+    def purchase_inspector(self, summary: PurchaseSummary) -> str:
+        response = self.request(
+            "GET",
+            "purchase_toUpdate?openWindow=Y&type=view&id=" + summary.purchase_id,
+        )
+        return (_input_value(response.text, "merchandiserName") or "").strip()
+
     def purchase_detail(
         self,
         summary: PurchaseSummary,
@@ -963,6 +971,38 @@ def crawl_production_dailies(
     return result
 
 
+def fill_missing_inspectors(
+    erp: ErpPurchaseClient,
+    summaries: list[PurchaseSummary],
+    purchase_codes: set[str],
+    *,
+    detail_workers: int,
+) -> list[PurchaseSummary]:
+    targets = [
+        summary
+        for summary in summaries
+        if summary.purchase_code in purchase_codes and not summary.inspector
+    ]
+    if not targets:
+        return summaries
+    inspectors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=max(1, detail_workers)) as executor:
+        values = executor.map(erp.purchase_inspector, targets)
+        for summary, inspector in zip(targets, values, strict=True):
+            if inspector:
+                inspectors[summary.purchase_code] = inspector
+    print(
+        f"ERP inspector detail fallback={len(inspectors)}/"
+        f"{len(targets)} orders with empty list values"
+    )
+    return [
+        replace(summary, inspector=inspectors[summary.purchase_code])
+        if summary.purchase_code in inspectors
+        else summary
+        for summary in summaries
+    ]
+
+
 def find_completed_orders(
     erp: ErpPurchaseClient,
     purchase_codes: set[str],
@@ -988,6 +1028,7 @@ def find_completed_orders(
 def crawl_new_orders(
     erp: ErpPurchaseClient,
     existing_contracts: set[str],
+    missing_inspector_contracts: set[str],
     *,
     limit: int | None,
     detail_workers: int,
@@ -998,6 +1039,17 @@ def crawl_new_orders(
     int,
 ]:
     summaries = erp.purchase_summaries()
+    new_contracts = {
+        summary.purchase_code
+        for summary in summaries
+        if summary.purchase_code not in existing_contracts
+    }
+    summaries = fill_missing_inspectors(
+        erp,
+        summaries,
+        missing_inspector_contracts | new_contracts,
+        detail_workers=detail_workers,
+    )
     production_dailies = crawl_production_dailies(
         erp, summaries, detail_workers=detail_workers
     )
@@ -1363,6 +1415,18 @@ def main() -> int:
                 )
             )
         }
+        missing_inspector_contracts = {
+            contract
+            for record in tracked_order_records
+            if not _field_text(
+                (record.get("fields") or {}).get("睿贝质检员")
+            )
+            and (
+                contract := _field_text(
+                    (record.get("fields") or {}).get("合同号")
+                )
+            )
+        }
         erp = ErpPurchaseClient(
             base_url=args.base_url,
             token_file=args.token_file,
@@ -1373,6 +1437,7 @@ def main() -> int:
         orders, summaries, production_dailies, selected_count = crawl_new_orders(
             erp,
             existing_contracts,
+            missing_inspector_contracts,
             limit=args.limit,
             detail_workers=args.detail_workers,
         )
@@ -1381,6 +1446,12 @@ def main() -> int:
         completed_summaries = find_completed_orders(
             erp,
             missing_from_active,
+            detail_workers=args.detail_workers,
+        )
+        completed_summaries = fill_missing_inspectors(
+            erp,
+            completed_summaries,
+            missing_inspector_contracts,
             detail_workers=args.detail_workers,
         )
         completed_production_dailies = crawl_production_dailies(
