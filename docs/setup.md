@@ -67,10 +67,16 @@ permissions (the Chinese labels can differ slightly by console version):
   API is used to read the current member.
 - `contact:user.department:readonly` — **获取用户组织架构信息（高级）**. Needed
   for `department_ids` / `open_department_id` values.
+- `contact:department.base:readonly` — **获取部门基础信息**. Needed by the ERP
+  sync to enumerate child departments before resolving inspector names.
 
 Also set the app's Contact permission range to include the signing-in users (or
-all members). `contact:department.base:readonly` is only needed later if the
-system must resolve each stored department ID to a department *name*.
+all members).
+
+The ERP purchase sync also uses this Contact permission range to convert the
+text field `睿贝质检员` into the Bitable Person field `质检员`. Include every
+quality inspector in the range. Only an exact, unique Feishu display-name match
+is written; missing or duplicate names are logged and left unchanged.
 
 Department synchronization is currently disabled by default
 (`FEISHU_SYNC_DEPARTMENTS=false`) so it cannot prevent login. When revisiting
@@ -115,6 +121,35 @@ preserved in `feishu_fields`; the queryable fields are
 and name. On a server, route this HTTPS path directly to FastAPI behind a
 reverse proxy instead of depending on the Vite development proxy.
 
+The ERP purchase script calls this same endpoint directly after it writes a
+`质检员` person value. This does not depend on Bitable record-change automation,
+because API/batch-originated edits are not guaranteed to enter that trigger
+path. Failed calls are retained in
+`backend/data/erp_assignment_sync_queue.json` and retried by the next cron run.
+`FEISHU_SYNC_WEBHOOK_URL` can override the destination; otherwise the script
+uses `WEB_ORIGIN + /api/v1/integrations/feishu/order-sync`.
+When cron executes the script with `docker compose exec api`, prefer the local
+container endpoint to avoid a public-DNS round trip:
+
+```dotenv
+FEISHU_SYNC_WEBHOOK_URL=http://127.0.0.1:8000/api/v1/integrations/feishu/order-sync
+```
+
+After deploying this behavior for the first time, replay assignments that were
+written before direct delivery was enabled. The replay performs all three
+assignment actions: copies the order's `质检员` to every matching task row,
+sets the order's `质检状态` to `已分配`, and then calls the backend webhook:
+
+```powershell
+.venv\Scripts\python.exe scripts\sync_erp_purchases.py --sync-assignees-only
+```
+
+The replay skips rows whose `订单状态` is `测试订单`. The existing Bitable
+automation can remain enabled during rollout because repeated delivery is safe.
+After verifying the replay, disable `同步任务分配到后端`, `更新质检员`, and
+`更新分配字段` to avoid duplicate work. Keep `取消任务分配` enabled because it
+represents an administrator's explicit manual action.
+
 To revoke an assignment, configure the reset-button automation to POST the same
 header and body to:
 
@@ -129,6 +164,31 @@ contract, and leaves task definitions and photo history intact. It does not
 write to either Bitable table; clearing Bitable task cells remains the reset
 automation's responsibility. Repeating the request is safe and returns zero
 updated rows after the assignment is already clear.
+
+ERP purchase orders that move from `执行中` to `已完成` are retired by the
+purchase synchronization script instead of being retained as completed rows.
+The script first calls the backend retirement endpoint, then deletes every
+matching row from `质检任务表`, and finally deletes the order from `订单表`:
+
+```text
+POST /api/v1/integrations/feishu/order-retire
+```
+
+The backend clears the contract's inspector identity from local order items and
+photo tasks, so the task no longer appears on that inspector's dashboard. Local
+task definitions and submitted photo history are retained for audit. If the
+backend call or either Bitable deletion fails, the order remains eligible for a
+later cron retry; `测试订单` rows are never retired by this process. Existing
+legacy rows already marked `已完成` are also cleanup candidates.
+
+`FEISHU_RETIRE_WEBHOOK_URL` can explicitly set the retirement endpoint. When
+`FEISHU_SYNC_WEBHOOK_URL` ends in `/order-sync`, the script automatically uses
+the same URL with `/order-retire`, so the normal container configuration needs
+no additional setting. For an explicit local-container URL:
+
+```dotenv
+FEISHU_RETIRE_WEBHOOK_URL=http://127.0.0.1:8000/api/v1/integrations/feishu/order-retire
+```
 
 ## 生产服务器部署（Docker Compose + Caddy）
 
@@ -242,7 +302,7 @@ docker compose --env-file .env.production -f docker-compose.production.yml logs 
 
 ## 启动 ERP 订单抓取定时任务
 
-ERP 抓取脚本会把新合同和产品任务写入飞书多维表格，并更新已有任务的 `质检阶段`；飞书自动化随后调用 Webhook 将数据导入本系统。因此飞书自动化和此定时任务应同时启用。
+ERP 抓取脚本会把新合同和产品任务写入飞书多维表格，更新已有任务的 `质检阶段`，同步订单质检员到同合同号的任务，将订单 `质检状态` 更新为 `已分配`，并直接调用后端 Webhook。程序写入不再依赖飞书自动化；飞书自动化只需保留给管理员手工修改和取消分配使用。
 
 首次部署时，在 API 容器人工验证（均在仓库根目录运行）：
 

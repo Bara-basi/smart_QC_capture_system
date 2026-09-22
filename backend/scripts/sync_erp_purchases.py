@@ -28,6 +28,7 @@ import re
 import sys
 import tempfile
 import threading
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime, time
@@ -46,9 +47,9 @@ from app.core.config import settings
 from scripts.erp_login import (
     DEFAULT_BASE_URL,
     DEFAULT_TOKEN_FILE,
+    SESSION_TIMEOUT_MARKER,
     AuthenticationResult,
     ErpAuthenticationError,
-    SESSION_TIMEOUT_MARKER,
     _cookies_from_client,
     _input_value,
     _primary_token,
@@ -68,6 +69,11 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_SNAPSHOT_FILE = (
     Path(__file__).resolve().parents[1] / "data" / "erp_purchase_snapshot.json"
 )
+DEFAULT_ASSIGNMENT_QUEUE_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "erp_assignment_sync_queue.json"
+)
 FACTORY_MAPPING_FILENAME = "factroy_mapping.json"
 ORDER_CODE_PATTERN = re.compile(
     r"^(?:\d{2}MT|SP)-?(?:\d{2}[A-Z]\d{3}Y?|DP\d{3})",
@@ -81,18 +87,27 @@ ORDER_FIELDS = {
     "订单状态",
     "工厂",
     "睿贝质检员",
+    "质检员",
     "生产内容",
     "生产日报创建时间",
     "工厂交期",
 }
-TASK_FIELDS = {"合同号", "序号", "产品类型", "规格", "数量", "质检阶段"}
+TASK_FIELDS = {
+    "合同号",
+    "序号",
+    "产品类型",
+    "规格",
+    "数量",
+    "质检阶段",
+    "质检员",
+}
 ORDER_METADATA_FIELD_TYPES = {
     "睿贝质检员": 1,
     "生产内容": 1,
     "生产日报创建时间": 5,
     "工厂交期": 5,
 }
-UNTRACKED_ORDER_STATUSES = {"已完成", "测试订单"}
+UNTRACKED_ORDER_STATUSES = {"测试订单"}
 
 
 class ErpProtocolError(RuntimeError):
@@ -675,6 +690,16 @@ def _field_text(value: Any) -> str:
     return str(value).strip()
 
 
+def _person_open_id(value: Any) -> str:
+    if not isinstance(value, list) or len(value) != 1:
+        return ""
+    person = value[0]
+    if not isinstance(person, dict):
+        return ""
+    open_id = _field_text(person.get("id") or person.get("open_id"))
+    return open_id if open_id.startswith("ou_") else ""
+
+
 class FeishuPurchaseSyncClient:
     def __init__(self, *, timeout: float) -> None:
         required = {
@@ -795,7 +820,8 @@ class FeishuPurchaseSyncClient:
     def validate_fields(self) -> None:
         order_fields = self.fields(settings.feishu_bitable_order_table_id)
         order_names = set(order_fields)
-        task_names = set(self.fields(settings.feishu_bitable_table_id))
+        task_fields = self.fields(settings.feishu_bitable_table_id)
+        task_names = set(task_fields)
         missing_order = ORDER_FIELDS - order_names
         missing_task = TASK_FIELDS - task_names
         if missing_order or missing_task:
@@ -817,6 +843,10 @@ class FeishuPurchaseSyncClient:
                 "Feishu 订单状态 must be a SingleSelect field with "
                 "执行中, 已完成, and 测试订单 options"
             )
+        if order_fields["质检员"].get("type") != 11:
+            raise FeishuSyncError("Feishu 质检员 field must be a Person field")
+        if task_fields["质检员"].get("type") != 11:
+            raise FeishuSyncError("Feishu task 质检员 field must be a Person field")
 
     def iter_records(
         self, table_id: str, *, view_id: str | None = None
@@ -874,8 +904,101 @@ class FeishuPurchaseSyncClient:
     def existing_tasks(self) -> list[dict[str, Any]]:
         return self.iter_records(settings.feishu_bitable_table_id)
 
+    def inspector_open_ids(
+        self, records: list[dict[str, Any]]
+    ) -> tuple[dict[str, str], set[str]]:
+        """Resolve exact, unique Feishu names to app-scoped open IDs.
+
+        Existing person cells remain a useful fallback when the application's
+        Contact data range does not yet include every inspector.
+        """
+        candidates: dict[str, set[str]] = defaultdict(set)
+        for record in records:
+            value = (record.get("fields") or {}).get("质检员")
+            if not isinstance(value, list):
+                continue
+            for person in value:
+                if not isinstance(person, dict):
+                    continue
+                name = _field_text(person.get("name"))
+                open_id = _field_text(person.get("id") or person.get("open_id"))
+                if name and open_id.startswith("ou_"):
+                    candidates[name].add(open_id)
+
+        def contact_items(
+            path: str, params: dict[str, Any], action: str
+        ) -> list[dict[str, Any]]:
+            items: list[dict[str, Any]] = []
+            page_token: str | None = None
+            while True:
+                request_params = {**params, "page_size": 50}
+                if page_token:
+                    request_params["page_token"] = page_token
+                response = self.client.get(
+                    f"{FEISHU_API}{path}",
+                    headers=self.headers,
+                    params=request_params,
+                )
+                self.request_count += 1
+                data = _check_feishu_response(response, action).get("data", {})
+                items.extend(data.get("items", []))
+                if not data.get("has_more"):
+                    return items
+                page_token = data.get("page_token")
+                if not page_token:
+                    raise FeishuSyncError(
+                        f"Feishu {action} pagination has no page_token"
+                    )
+
+        departments = contact_items(
+            "/contact/v3/departments/0/children",
+            {
+                "department_id_type": "open_department_id",
+                "fetch_child": "true",
+            },
+            "read Feishu departments for inspectors",
+        )
+        department_ids = ["0"]
+        department_ids.extend(
+            department_id
+            for department in departments
+            if (
+                department_id := _field_text(
+                    department.get("open_department_id")
+                )
+            )
+        )
+        for department_id in dict.fromkeys(department_ids):
+            people = contact_items(
+                "/contact/v3/users/find_by_department",
+                {
+                    "department_id": department_id,
+                    "department_id_type": "open_department_id",
+                    "user_id_type": "open_id",
+                },
+                "read Feishu contacts for inspectors",
+            )
+            for person in people:
+                name = _field_text(person.get("name"))
+                open_id = _field_text(person.get("open_id"))
+                if name and open_id.startswith("ou_"):
+                    candidates[name].add(open_id)
+
+        ambiguous = {name for name, ids in candidates.items() if len(ids) > 1}
+        unique = {
+            name: next(iter(ids))
+            for name, ids in candidates.items()
+            if len(ids) == 1
+        }
+        return unique, ambiguous
+
     def batch_create(
-        self, table_id: str, records: list[dict[str, Any]], *, label: str
+        self,
+        table_id: str,
+        records: list[dict[str, Any]],
+        *,
+        label: str,
+        assignment_record_ids: list[str] | None = None,
     ) -> int:
         created = 0
         for start in range(0, len(records), FEISHU_BATCH_SIZE):
@@ -885,6 +1008,7 @@ class FeishuPurchaseSyncClient:
                 f"{settings.feishu_bitable_app_token}/tables/{table_id}/"
                 "records/batch_create",
                 headers=self.headers,
+                params={"user_id_type": "open_id"},
                 json={"records": batch},
             )
             self.request_count += 1
@@ -894,6 +1018,13 @@ class FeishuPurchaseSyncClient:
                 raise FeishuSyncError(
                     f"Feishu created {len(items)} of {len(batch)} {label}"
                 )
+            if assignment_record_ids is not None:
+                for source, item in zip(batch, items, strict=True):
+                    if "质检员" not in (source.get("fields") or {}):
+                        continue
+                    record_id = _field_text(item.get("record_id"))
+                    if record_id:
+                        assignment_record_ids.append(record_id)
             created += len(items)
         return created
 
@@ -908,6 +1039,7 @@ class FeishuPurchaseSyncClient:
                 f"{settings.feishu_bitable_app_token}/tables/{table_id}/"
                 "records/batch_update",
                 headers=self.headers,
+                params={"user_id_type": "open_id"},
                 json={"records": batch},
             )
             self.request_count += 1
@@ -919,6 +1051,24 @@ class FeishuPurchaseSyncClient:
                 )
             updated += len(items)
         return updated
+
+    def batch_delete(
+        self, table_id: str, record_ids: list[str], *, label: str
+    ) -> int:
+        deleted = 0
+        for start in range(0, len(record_ids), FEISHU_BATCH_SIZE):
+            batch = record_ids[start : start + FEISHU_BATCH_SIZE]
+            response = self.client.post(
+                f"{FEISHU_API}/bitable/v1/apps/"
+                f"{settings.feishu_bitable_app_token}/tables/{table_id}/"
+                "records/batch_delete",
+                headers=self.headers,
+                json={"records": batch},
+            )
+            self.request_count += 1
+            _check_feishu_response(response, f"delete {label}")
+            deleted += len(batch)
+        return deleted
 
 
 def _purchase_date_timestamp(value: str) -> int:
@@ -944,6 +1094,135 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
         temporary = Path(temporary_name)
         if temporary.exists():
             temporary.unlink()
+
+
+def _assignment_webhook_url() -> str:
+    configured = settings.feishu_sync_webhook_url.strip()
+    if configured:
+        return configured
+    origin = settings.web_origin.strip().rstrip("/")
+    if not origin:
+        return ""
+    return f"{origin}{settings.api_prefix}/integrations/feishu/order-sync"
+
+
+def _retire_webhook_url() -> str:
+    configured = settings.feishu_retire_webhook_url.strip()
+    if configured:
+        return configured
+    assignment_url = settings.feishu_sync_webhook_url.strip()
+    if assignment_url.endswith("/order-sync"):
+        return f"{assignment_url[:-len('/order-sync')]}/order-retire"
+    origin = settings.web_origin.strip().rstrip("/")
+    if not origin:
+        return ""
+    return f"{origin}{settings.api_prefix}/integrations/feishu/order-retire"
+
+
+def _load_assignment_queue(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid assignment webhook queue {path}: {exc}") from exc
+    if not isinstance(payload, list) or not all(
+        isinstance(record_id, str) for record_id in payload
+    ):
+        raise ValueError(f"Invalid assignment webhook queue format: {path}")
+    return {record_id.strip() for record_id in payload if record_id.strip()}
+
+
+def _save_assignment_queue(path: Path, record_ids: set[str]) -> None:
+    _atomic_json_write(path, sorted(record_ids))
+
+
+def dispatch_assignment_webhooks(
+    record_ids: set[str],
+    *,
+    timeout: float,
+) -> tuple[set[str], dict[str, str]]:
+    """Call the existing assignment webhook; return successes and failures."""
+    if not record_ids:
+        return set(), {}
+    url = _assignment_webhook_url()
+    secret = settings.feishu_sync_webhook_secret.strip()
+    if not url or not secret or secret.startswith("CHANGE_ME"):
+        return set(), {
+            record_id: "FEISHU_SYNC_WEBHOOK_URL/WEB_ORIGIN or secret is not configured"
+            for record_id in record_ids
+        }
+
+    succeeded: set[str] = set()
+    failed: dict[str, str] = {}
+    with httpx.Client(timeout=timeout) as client:
+        for record_id in sorted(record_ids):
+            try:
+                response = client.post(
+                    url,
+                    headers={"X-QC-Sync-Secret": secret},
+                    json={"record_id": record_id},
+                )
+                if response.is_success:
+                    succeeded.add(record_id)
+                    continue
+                detail = response.text.strip().replace("\n", " ")[:300]
+                failed[record_id] = f"HTTP {response.status_code}: {detail}"
+            except httpx.HTTPError as exc:
+                failed[record_id] = str(exc)
+    return succeeded, failed
+
+
+def dispatch_retirement_webhooks(
+    records: list[dict[str, str]],
+    *,
+    timeout: float,
+) -> tuple[set[str], dict[str, str]]:
+    """Remove completed contracts from inspectors before deleting Bitable rows."""
+    if not records:
+        return set(), {}
+    url = _retire_webhook_url()
+    secret = settings.feishu_sync_webhook_secret.strip()
+    if not url or not secret or secret.startswith("CHANGE_ME"):
+        return set(), {
+            record["record_id"]: (
+                "FEISHU_RETIRE_WEBHOOK_URL/WEB_ORIGIN or secret is not configured"
+            )
+            for record in records
+        }
+
+    succeeded: set[str] = set()
+    failed: dict[str, str] = {}
+    with httpx.Client(timeout=timeout) as client:
+        for record in records:
+            record_id = record["record_id"]
+            try:
+                response = client.post(
+                    url,
+                    headers={"X-QC-Sync-Secret": secret},
+                    json=record,
+                )
+                if response.is_success:
+                    succeeded.add(record_id)
+                    continue
+                detail = response.text.strip().replace("\n", " ")[:300]
+                failed[record_id] = f"HTTP {response.status_code}: {detail}"
+            except httpx.HTTPError as exc:
+                failed[record_id] = str(exc)
+    return succeeded, failed
+
+
+def flush_assignment_queue(path: Path, *, timeout: float) -> tuple[int, int]:
+    pending = _load_assignment_queue(path)
+    succeeded, failed = dispatch_assignment_webhooks(pending, timeout=timeout)
+    remaining = pending - succeeded
+    _save_assignment_queue(path, remaining)
+    for record_id, reason in failed.items():
+        print(
+            f"WARNING: assignment webhook failed for {record_id}: {reason}",
+            file=sys.stderr,
+        )
+    return len(succeeded), len(remaining)
 
 
 def crawl_production_dailies(
@@ -1094,8 +1373,10 @@ def _task_write_plan(
     existing_records: list[dict[str, Any]],
     orders: list[PurchaseOrder],
     active_stages: dict[str, str],
+    inspector_open_ids: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Plan creates by natural key and stage updates by Feishu record ID."""
+    inspector_open_ids = inspector_open_ids or {}
     existing_keys: set[tuple[str, str]] = set()
     update_records: list[dict[str, Any]] = []
     for record in existing_records:
@@ -1133,8 +1414,108 @@ def _task_write_plan(
                     }
                 }
             )
+            if open_id := inspector_open_ids.get(order.inspector):
+                create_records[-1]["fields"]["质检员"] = [{"id": open_id}]
             existing_keys.add(key)
     return create_records, update_records
+
+
+def _task_inspector_update_plan(
+    existing_records: list[dict[str, Any]],
+    contract_inspector_open_ids: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Mirror each order inspector to all task rows with the same contract."""
+    updates: list[dict[str, Any]] = []
+    for record in existing_records:
+        fields = record.get("fields") or {}
+        contract = _field_text(fields.get("合同号"))
+        open_id = contract_inspector_open_ids.get(contract)
+        record_id = _field_text(record.get("record_id"))
+        if not record_id or not open_id:
+            continue
+        current_ids = {
+            _field_text(person.get("id") or person.get("open_id"))
+            for person in (fields.get("质检员") or [])
+            if isinstance(person, dict)
+        }
+        if current_ids != {open_id}:
+            updates.append(
+                {"record_id": record_id, "fields": {"质检员": [{"id": open_id}]}}
+            )
+    return updates
+
+
+def _contract_inspectors_from_orders(
+    order_records: list[dict[str, Any]],
+    *,
+    exclude_test_orders: bool = False,
+) -> tuple[dict[str, str], set[str]]:
+    """Return contract-to-person mappings and assignable order record IDs."""
+    contract_inspectors: dict[str, str] = {}
+    record_ids: set[str] = set()
+    for record in order_records:
+        fields = record.get("fields") or {}
+        if exclude_test_orders and _field_text(fields.get("订单状态")) == "测试订单":
+            continue
+        contract = _field_text(fields.get("合同号"))
+        open_id = _person_open_id(fields.get("质检员"))
+        record_id = _field_text(record.get("record_id"))
+        if contract and open_id:
+            contract_inspectors[contract] = open_id
+        if record_id and open_id:
+            record_ids.add(record_id)
+    return contract_inspectors, record_ids
+
+
+def _order_assignment_status_update_plan(
+    order_records: list[dict[str, Any]],
+    *,
+    exclude_test_orders: bool = False,
+) -> list[dict[str, Any]]:
+    updates: list[dict[str, Any]] = []
+    for record in order_records:
+        fields = record.get("fields") or {}
+        if exclude_test_orders and _field_text(fields.get("订单状态")) == "测试订单":
+            continue
+        record_id = _field_text(record.get("record_id"))
+        if (
+            record_id
+            and _person_open_id(fields.get("质检员"))
+            and _field_text(fields.get("质检状态")) != "已分配"
+        ):
+            updates.append(
+                {"record_id": record_id, "fields": {"质检状态": "已分配"}}
+            )
+    return updates
+
+
+def _completed_order_cleanup_plan(
+    order_records: list[dict[str, Any]],
+    task_records: list[dict[str, Any]],
+    completed_contracts: set[str],
+) -> list[dict[str, Any]]:
+    task_ids_by_contract: dict[str, list[str]] = defaultdict(list)
+    for task in task_records:
+        fields = task.get("fields") or {}
+        contract = _field_text(fields.get("合同号"))
+        record_id = _field_text(task.get("record_id"))
+        if contract in completed_contracts and record_id:
+            task_ids_by_contract[contract].append(record_id)
+
+    cleanup: list[dict[str, Any]] = []
+    for order in order_records:
+        fields = order.get("fields") or {}
+        contract = _field_text(fields.get("合同号"))
+        record_id = _field_text(order.get("record_id"))
+        if contract in completed_contracts and record_id:
+            cleanup.append(
+                {
+                    "contract_no": contract,
+                    "record_id": record_id,
+                    "task_record_ids": task_ids_by_contract.get(contract, []),
+                }
+            )
+    return cleanup
 
 
 def _factory_backfill_plan(
@@ -1179,8 +1560,10 @@ def _order_metadata_update_plan(
     summaries: list[PurchaseSummary],
     production_dailies: dict[str, ProductionDaily],
     tracking_statuses: dict[str, str] | None = None,
+    inspector_open_ids: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     tracking_statuses = tracking_statuses or {}
+    inspector_open_ids = inspector_open_ids or {}
     by_contract = {
         _field_text((record.get("fields") or {}).get("合同号")): record
         for record in existing_records
@@ -1198,13 +1581,20 @@ def _order_metadata_update_plan(
             production_dailies.get(summary.purchase_code),
             summary.factory_delivery_date,
         )
+        if open_id := inspector_open_ids.get(summary.inspector):
+            targets["质检员"] = [{"id": open_id}]
+            targets["质检状态"] = "已分配"
         tracking_status = tracking_statuses.get(summary.purchase_code)
         if tracking_status:
             targets["订单状态"] = tracking_status
         changed: dict[str, Any] = {}
         for field_name, target in targets.items():
             current_value = current.get(field_name)
-            if isinstance(target, str):
+            if field_name == "质检员":
+                target_open_id = _field_text(target[0].get("id"))
+                if _person_open_id(current_value) != target_open_id:
+                    changed[field_name] = target
+            elif isinstance(target, str):
                 if _field_text(current_value) != target:
                     changed[field_name] = target
             elif current_value != target:
@@ -1215,16 +1605,65 @@ def _order_metadata_update_plan(
     return updates
 
 
-def _order_create_records(
-    orders: list[PurchaseOrder], purchase_date_field: str
+def _inspector_person_update_plan(
+    existing_records: list[dict[str, Any]],
+    inspector_open_ids: dict[str, str],
 ) -> list[dict[str, Any]]:
+    """Backfill person cells from existing ERP inspector text values."""
+    updates: list[dict[str, Any]] = []
+    for record in existing_records:
+        fields = record.get("fields") or {}
+        inspector = _field_text(fields.get("睿贝质检员"))
+        open_id = inspector_open_ids.get(inspector)
+        record_id = _field_text(record.get("record_id"))
+        if not record_id or not open_id:
+            continue
+        current_ids = {
+            _field_text(person.get("id") or person.get("open_id"))
+            for person in (fields.get("质检员") or [])
+            if isinstance(person, dict)
+        }
+        changed: dict[str, Any] = {}
+        if current_ids != {open_id}:
+            changed["质检员"] = [{"id": open_id}]
+        if _field_text(fields.get("质检状态")) != "已分配":
+            changed["质检状态"] = "已分配"
+        if changed:
+            updates.append({"record_id": record_id, "fields": changed})
+    return updates
+
+
+def _merge_record_updates(
+    *plans: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for plan in plans:
+        for update in plan:
+            record_id = _field_text(update.get("record_id"))
+            if not record_id:
+                continue
+            target = merged.setdefault(
+                record_id, {"record_id": record_id, "fields": {}}
+            )
+            target["fields"].update(update.get("fields") or {})
+    return list(merged.values())
+
+
+def _order_create_records(
+    orders: list[PurchaseOrder],
+    purchase_date_field: str,
+    inspector_open_ids: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    inspector_open_ids = inspector_open_ids or {}
     records: list[dict[str, Any]] = []
     for order in orders:
         fields: dict[str, Any] = {
             "合同号": order.purchase_code,
             purchase_date_field: _purchase_date_timestamp(order.purchase_date),
             "产品类型": order.product_types,
-            "质检状态": "待分配",
+            "质检状态": (
+                "已分配" if order.inspector in inspector_open_ids else "待分配"
+            ),
             "订单状态": "执行中",
         }
         production_daily = None
@@ -1241,6 +1680,8 @@ def _order_create_records(
                 order.factory_delivery_date,
             )
         )
+        if open_id := inspector_open_ids.get(order.inspector):
+            fields["质检员"] = [{"id": open_id}]
         records.append({"fields": fields})
     return records
 
@@ -1264,23 +1705,136 @@ def sync_to_feishu(
     active_stages: dict[str, str],
     *,
     ensure_schema: bool,
-) -> tuple[int, int, int, int]:
+    timeout: float,
+) -> tuple[int, int, int, int, set[str], int, int, int]:
     feishu.ensure_order_metadata_fields(create_if_missing=ensure_schema)
     feishu.validate_fields()
-    task_records, task_updates = _task_write_plan(
-        feishu.existing_tasks(), orders, active_stages
+    existing_task_records = feishu.existing_tasks()
+    completed_contracts = {
+        summary.purchase_code for summary in completed_summaries
+    }
+    cleanup_plan = _completed_order_cleanup_plan(
+        existing_orders, existing_task_records, completed_contracts
     )
-    tracked_summaries = [*summaries, *completed_summaries]
+    retired_order_ids, retirement_failures = dispatch_retirement_webhooks(
+        [
+            {
+                "record_id": cleanup["record_id"],
+                "contract_no": cleanup["contract_no"],
+            }
+            for cleanup in cleanup_plan
+        ],
+        timeout=timeout,
+    )
+    for record_id, reason in retirement_failures.items():
+        print(
+            f"WARNING: completed order retirement failed for {record_id}: {reason}",
+            file=sys.stderr,
+        )
+    successful_cleanup = [
+        cleanup
+        for cleanup in cleanup_plan
+        if cleanup["record_id"] in retired_order_ids
+    ]
+    deleted_tasks = feishu.batch_delete(
+        settings.feishu_bitable_table_id,
+        [
+            task_id
+            for cleanup in successful_cleanup
+            for task_id in cleanup["task_record_ids"]
+        ],
+        label="completed inspection tasks",
+    )
+    deleted_orders = feishu.batch_delete(
+        settings.feishu_bitable_order_table_id,
+        [cleanup["record_id"] for cleanup in successful_cleanup],
+        label="completed orders",
+    )
+    existing_orders = [
+        record
+        for record in existing_orders
+        if _field_text((record.get("fields") or {}).get("合同号"))
+        not in completed_contracts
+    ]
+    existing_task_records = [
+        record
+        for record in existing_task_records
+        if _field_text((record.get("fields") or {}).get("合同号"))
+        not in completed_contracts
+    ]
+    inspector_open_ids, ambiguous_inspectors = feishu.inspector_open_ids(
+        [*existing_orders, *existing_task_records]
+    )
+    tracked_summaries = list(summaries)
+    contract_inspector_open_ids: dict[str, str] = {}
+    existing_contract_inspectors, _ = _contract_inspectors_from_orders(
+        existing_orders
+    )
+    contract_inspector_open_ids.update(existing_contract_inspectors)
+    for record in existing_orders:
+        fields = record.get("fields") or {}
+        contract = _field_text(fields.get("合同号"))
+        inspector = _field_text(fields.get("睿贝质检员"))
+        if contract and (open_id := inspector_open_ids.get(inspector)):
+            contract_inspector_open_ids[contract] = open_id
+    for summary in tracked_summaries:
+        if open_id := inspector_open_ids.get(summary.inspector):
+            contract_inspector_open_ids[summary.purchase_code] = open_id
+    for order in orders:
+        if open_id := inspector_open_ids.get(order.inspector):
+            contract_inspector_open_ids[order.purchase_code] = open_id
+
+    task_records, stage_updates = _task_write_plan(
+        existing_task_records,
+        orders,
+        active_stages,
+        inspector_open_ids,
+    )
+    task_updates = _merge_record_updates(
+        stage_updates,
+        _task_inspector_update_plan(
+            existing_task_records, contract_inspector_open_ids
+        ),
+    )
     tracking_statuses = {
         **{summary.purchase_code: "执行中" for summary in summaries},
-        **{summary.purchase_code: "已完成" for summary in completed_summaries},
     }
-    order_updates = _order_metadata_update_plan(
-        existing_orders,
-        tracked_summaries,
-        production_dailies,
-        tracking_statuses,
+    order_updates = _merge_record_updates(
+        _order_metadata_update_plan(
+            existing_orders,
+            tracked_summaries,
+            production_dailies,
+            tracking_statuses,
+            inspector_open_ids,
+        ),
+        _inspector_person_update_plan(existing_orders, inspector_open_ids),
     )
+    inspector_names = {
+        name
+        for name in [
+            *(
+                _field_text((record.get("fields") or {}).get("睿贝质检员"))
+                for record in existing_orders
+            ),
+            *(summary.inspector for summary in tracked_summaries),
+            *(order.inspector for order in orders),
+        ]
+        if name
+    }
+    unresolved_inspectors = sorted(inspector_names - inspector_open_ids.keys())
+    if ambiguous_inspectors:
+        print(
+            "WARNING: duplicate Feishu contact names were not mapped: "
+            + ", ".join(sorted(ambiguous_inspectors)),
+            file=sys.stderr,
+        )
+    if unresolved_inspectors:
+        print(
+            "WARNING: no unique Feishu open_id for ERP inspectors; expand the "
+            "app Contact data range or assign the person once in Bitable: "
+            + ", ".join(unresolved_inspectors),
+            file=sys.stderr,
+        )
     purchase_date_field = (
         feishu.ensure_purchase_date_field(create_if_missing=ensure_schema)
         if orders
@@ -1288,7 +1842,19 @@ def sync_to_feishu(
     )
     # Build every order record before the first write. This validates the factory
     # mapping and purchase dates without leaving a partial synchronization behind.
-    order_records = _order_create_records(orders, purchase_date_field)
+    order_records = _order_create_records(
+        orders, purchase_date_field, inspector_open_ids
+    )
+    assignment_record_ids = {
+        record_id
+        for update in order_updates
+        if (
+            "质检员" in (update.get("fields") or {})
+            or (update.get("fields") or {}).get("质检状态") == "已分配"
+        )
+        and (record_id := _field_text(update.get("record_id")))
+    }
+    created_assignment_record_ids: list[str] = []
 
     # Tasks are inserted first. If a later order insert fails, the next run can
     # deduplicate by natural key, update its stage, and retry the order record.
@@ -1311,8 +1877,19 @@ def sync_to_feishu(
         settings.feishu_bitable_order_table_id,
         order_records,
         label="orders",
+        assignment_record_ids=created_assignment_record_ids,
     )
-    return created_orders, created_tasks, updated_tasks, updated_orders
+    assignment_record_ids.update(created_assignment_record_ids)
+    return (
+        created_orders,
+        created_tasks,
+        updated_tasks,
+        updated_orders,
+        assignment_record_ids,
+        deleted_orders,
+        deleted_tasks,
+        len(retirement_failures),
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1340,6 +1917,15 @@ def _build_parser() -> argparse.ArgumentParser:
             os.getenv("ERP_PURCHASE_SNAPSHOT_FILE", DEFAULT_SNAPSHOT_FILE)
         ),
     )
+    parser.add_argument(
+        "--assignment-queue-file",
+        type=Path,
+        default=Path(
+            os.getenv(
+                "ERP_ASSIGNMENT_QUEUE_FILE", DEFAULT_ASSIGNMENT_QUEUE_FILE
+            )
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--detail-workers", type=int, default=4)
     parser.add_argument("--limit", type=int)
@@ -1357,6 +1943,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--backfill-factories-only",
         action="store_true",
         help="Fill empty 工厂 cells in the Feishu order table, then exit without reading ERP.",
+    )
+    parser.add_argument(
+        "--sync-assignees-only",
+        action="store_true",
+        help=(
+            "Replay assignment automation for every non-test order: mirror "
+            "质检员 to tasks, set 已分配, and call the backend webhook."
+        ),
     )
     return parser
 
@@ -1393,6 +1987,44 @@ def main() -> int:
                 f"Feishu requests={feishu.request_count}"
             )
             return 0
+        if args.sync_assignees_only:
+            feishu.validate_fields()
+            order_records = feishu.existing_orders()
+            task_records = feishu.existing_tasks()
+            contract_inspectors, record_ids = _contract_inspectors_from_orders(
+                order_records, exclude_test_orders=True
+            )
+            task_updates = _task_inspector_update_plan(
+                task_records, contract_inspectors
+            )
+            order_updates = _order_assignment_status_update_plan(
+                order_records, exclude_test_orders=True
+            )
+            updated_tasks = feishu.batch_update(
+                settings.feishu_bitable_table_id,
+                task_updates,
+                label="inspection task assignees",
+            )
+            updated_orders = feishu.batch_update(
+                settings.feishu_bitable_order_table_id,
+                order_updates,
+                label="order assignment statuses",
+            )
+            pending = _load_assignment_queue(args.assignment_queue_file)
+            _save_assignment_queue(
+                args.assignment_queue_file, pending | record_ids
+            )
+            dispatched, remaining = flush_assignment_queue(
+                args.assignment_queue_file, timeout=args.timeout
+            )
+            print(
+                f"Assignee sync complete: queued={len(record_ids)}, "
+                f"updated_tasks={updated_tasks}, "
+                f"updated_orders={updated_orders}, "
+                f"dispatched={dispatched}, remaining={remaining}, "
+                f"Feishu requests={feishu.request_count}"
+            )
+            return 0 if remaining == 0 else 1
         feishu.ensure_order_metadata_fields(create_if_missing=args.ensure_schema)
         feishu.validate_fields()
         all_order_records = feishu.existing_orders()
@@ -1448,18 +2080,6 @@ def main() -> int:
             missing_from_active,
             detail_workers=args.detail_workers,
         )
-        completed_summaries = fill_missing_inspectors(
-            erp,
-            completed_summaries,
-            missing_inspector_contracts,
-            detail_workers=args.detail_workers,
-        )
-        completed_production_dailies = crawl_production_dailies(
-            erp,
-            completed_summaries,
-            detail_workers=args.detail_workers,
-        )
-        production_dailies.update(completed_production_dailies)
         completed_contracts = {
             summary.purchase_code for summary in completed_summaries
         }
@@ -1468,14 +2088,10 @@ def main() -> int:
         )
         tracking_statuses = {
             **{summary.purchase_code: "执行中" for summary in summaries},
-            **{
-                summary.purchase_code: "已完成"
-                for summary in completed_summaries
-            },
         }
         planned_order_updates = _order_metadata_update_plan(
             tracked_order_records,
-            [*summaries, *completed_summaries],
+            summaries,
             production_dailies,
             tracking_statuses,
         )
@@ -1515,7 +2131,16 @@ def main() -> int:
             for summary in summaries
             if summary.order_status
         }
-        created_orders, created_tasks, updated_tasks, updated_orders = sync_to_feishu(
+        (
+            created_orders,
+            created_tasks,
+            updated_tasks,
+            updated_orders,
+            assignment_record_ids,
+            deleted_orders,
+            deleted_tasks,
+            failed_retirements,
+        ) = sync_to_feishu(
             feishu,
             orders,
             summaries,
@@ -1524,15 +2149,35 @@ def main() -> int:
             tracked_order_records,
             active_stages,
             ensure_schema=args.ensure_schema,
+            timeout=args.timeout,
+        )
+        pending_assignments = _load_assignment_queue(args.assignment_queue_file)
+        _save_assignment_queue(
+            args.assignment_queue_file,
+            pending_assignments | assignment_record_ids,
+        )
+        dispatched_assignments, pending_assignments_count = (
+            flush_assignment_queue(
+                args.assignment_queue_file, timeout=args.timeout
+            )
         )
         print(
             f"Sync complete: created_orders={created_orders}, "
             f"created_tasks={created_tasks}, updated_task_stages={updated_tasks}, "
             f"updated_order_metadata={updated_orders}, "
+            f"deleted_completed_orders={deleted_orders}, "
+            f"deleted_completed_tasks={deleted_tasks}, "
+            f"failed_retirements={failed_retirements}, "
+            f"dispatched_assignments={dispatched_assignments}, "
+            f"pending_assignments={pending_assignments_count}, "
             f"ERP requests={erp.request_count}, "
             f"Feishu requests={feishu.request_count}"
         )
-        return 0
+        return (
+            0
+            if pending_assignments_count == 0 and failed_retirements == 0
+            else 1
+        )
     except (
         ErpAuthenticationError,
         ErpProtocolError,

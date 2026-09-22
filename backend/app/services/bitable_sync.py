@@ -304,6 +304,43 @@ async def sync_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
         await connection.close()
 
 
+async def _clear_contract_assignment(
+    connection: asyncpg.Connection, contract_no: str
+) -> dict[str, int]:
+    async with connection.transaction():
+        order_result = await connection.execute(
+            """UPDATE order_items
+               SET inspector_open_id = NULL,
+                   inspector_union_id = NULL,
+                   inspector_name = NULL,
+                   feishu_fields = feishu_fields
+                       - ARRAY['质检员', '检验员', 'inspector']::text[],
+                   updated_at = NOW()
+               WHERE contract_no = $1
+                 AND (inspector_open_id IS NOT NULL
+                      OR inspector_union_id IS NOT NULL
+                      OR inspector_name IS NOT NULL
+                      OR feishu_fields ?| ARRAY['质检员', '检验员', 'inspector'])""",
+            contract_no,
+        )
+        task_result = await connection.execute(
+            """UPDATE inspection_photo_tasks
+               SET inspector_open_id = NULL,
+                   inspector_union_id = NULL,
+                   inspector_name = NULL,
+                   updated_at = NOW()
+               WHERE contract_no = $1
+                 AND (inspector_open_id IS NOT NULL
+                      OR inspector_union_id IS NOT NULL
+                      OR inspector_name IS NOT NULL)""",
+            contract_no,
+        )
+    return {
+        "order_items": _affected_rows(order_result),
+        "inspection_photo_tasks": _affected_rows(task_result),
+    }
+
+
 async def unassign_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
     """Remove one order's inspector assignment from the local application.
 
@@ -332,41 +369,47 @@ async def unassign_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
                 f"No synchronized order was found for record_id {selected_id}"
             )
 
-        async with connection.transaction():
-            order_result = await connection.execute(
-                """UPDATE order_items
-                   SET inspector_open_id = NULL,
-                       inspector_union_id = NULL,
-                       inspector_name = NULL,
-                       feishu_fields = feishu_fields
-                           - ARRAY['质检员', '检验员', 'inspector']::text[],
-                       updated_at = NOW()
-                   WHERE contract_no = $1
-                     AND (inspector_open_id IS NOT NULL
-                          OR inspector_union_id IS NOT NULL
-                          OR inspector_name IS NOT NULL
-                          OR feishu_fields ?| ARRAY['质检员', '检验员', 'inspector'])""",
-                contract_no,
-            )
-            task_result = await connection.execute(
-                """UPDATE inspection_photo_tasks
-                   SET inspector_open_id = NULL,
-                       inspector_union_id = NULL,
-                       inspector_name = NULL,
-                       updated_at = NOW()
-                   WHERE contract_no = $1
-                     AND (inspector_open_id IS NOT NULL
-                          OR inspector_union_id IS NOT NULL
-                          OR inspector_name IS NOT NULL)""",
-                contract_no,
-            )
-
-        result = {
-            "order_items": _affected_rows(order_result),
-            "inspection_photo_tasks": _affected_rows(task_result),
-        }
+        result = await _clear_contract_assignment(connection, str(contract_no))
         logger.info(
             "Feishu order unassign complete: record_id=%s contract_no=%s "
+            "order_items=%d tasks=%d elapsed=%.3fs",
+            selected_id,
+            contract_no,
+            result["order_items"],
+            result["inspection_photo_tasks"],
+            monotonic() - started_at,
+        )
+        return result
+    finally:
+        await connection.close()
+
+
+async def retire_order_webhook(payload: dict[str, Any]) -> dict[str, int]:
+    """Idempotently hide a completed contract from its assigned inspector."""
+    started_at = monotonic()
+    if not settings.database_url:
+        raise RuntimeError("DATABASE_URL is not configured")
+    selected_ids = _record_ids(payload)
+    if len(selected_ids) != 1:
+        raise SyncValidationError(
+            "The webhook request must contain exactly one record_id"
+        )
+    selected_id = next(iter(selected_ids))
+    payload_contract = _text(payload.get("contract_no"))
+
+    connection = await asyncpg.connect(_dsn())
+    try:
+        stored_contract = await connection.fetchval(
+            "SELECT contract_no FROM order_items WHERE feishu_record_id = $1",
+            selected_id,
+        )
+        contract_no = _text(stored_contract) or payload_contract
+        if not contract_no:
+            result = {"order_items": 0, "inspection_photo_tasks": 0}
+        else:
+            result = await _clear_contract_assignment(connection, contract_no)
+        logger.info(
+            "Completed order retirement: record_id=%s contract_no=%s "
             "order_items=%d tasks=%d elapsed=%.3fs",
             selected_id,
             contract_no,

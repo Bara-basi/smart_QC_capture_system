@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     feishu_bitable_inspection_task_status_field_id: str = ""
     feishu_status_sync_interval_seconds: int = 60
     feishu_sync_webhook_secret: str = ""
+    feishu_sync_webhook_url: str = ""
+    feishu_retire_webhook_url: str = ""
     erp_username: str = ""
     erp_password: str = ""
     oss_endpoint: str = ""

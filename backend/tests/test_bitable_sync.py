@@ -360,3 +360,46 @@ def test_unassign_webhook_rejects_unknown_order_record(
 
     assert connection.executions == []
     assert connection.closed is True
+
+
+def test_retire_webhook_uses_payload_contract_when_order_was_never_synced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_feishu(monkeypatch)
+    connection = _FakeUnassignConnection(contract_no=None)
+
+    async def connect(_: str) -> _FakeUnassignConnection:
+        return connection
+
+    monkeypatch.setattr(bitable_sync.asyncpg, "connect", connect)
+
+    result = asyncio.run(
+        bitable_sync.retire_order_webhook(
+            {"record_id": "rec_unknown", "contract_no": "26MT-001"}
+        )
+    )
+
+    assert result == {"order_items": 1, "inspection_photo_tasks": 4}
+    assert len(connection.executions) == 2
+    assert all(args == ("26MT-001",) for _, args in connection.executions)
+    assert connection.closed is True
+
+
+def test_retire_webhook_is_idempotent_without_any_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_feishu(monkeypatch)
+    connection = _FakeUnassignConnection(contract_no=None)
+
+    async def connect(_: str) -> _FakeUnassignConnection:
+        return connection
+
+    monkeypatch.setattr(bitable_sync.asyncpg, "connect", connect)
+
+    result = asyncio.run(
+        bitable_sync.retire_order_webhook({"record_id": "rec_unknown"})
+    )
+
+    assert result == {"order_items": 0, "inspection_photo_tasks": 0}
+    assert connection.executions == []
+    assert connection.closed is True

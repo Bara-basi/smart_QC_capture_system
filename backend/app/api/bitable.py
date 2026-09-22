@@ -11,6 +11,7 @@ from app.core.config import settings
 from app.integrations.feishu_bitable import FeishuBitableError
 from app.services.bitable_sync import (
     SyncValidationError,
+    retire_order_webhook,
     sync_order_webhook,
     unassign_order_webhook,
 )
@@ -54,6 +55,22 @@ async def unassign_order_from_bitable(
     _verify_webhook_secret(x_qc_sync_secret)
     try:
         return await unassign_order_webhook(payload)
+    except SyncValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except DatabaseUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@router.post("/order-retire")
+async def retire_order_from_bitable(
+    payload: dict[str, Any], x_qc_sync_secret: str | None = Header(default=None),
+) -> dict[str, int]:
+    """Remove a completed order from its inspector before Bitable deletion."""
+    _verify_webhook_secret(x_qc_sync_secret)
+    try:
+        return await retire_order_webhook(payload)
     except SyncValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except DatabaseUnavailable as exc:
