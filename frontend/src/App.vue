@@ -36,11 +36,11 @@ const isSubmitting = ref(false)
 const submitMode = ref<'save' | 'complete'>('complete')
 const uploadedTaskIds = ref<Set<string>>(new Set())
 const submitStatus = ref<'idle' | 'uploading' | 'success' | 'error'>('idle')
-const touchStartX = ref(0)
 const taskTabs = ref<HTMLElement | null>(null)
 const editingTaskIds = ref<Set<string>>(new Set())
 const editBaselinePhotoIds = ref<Record<string, string[]>>({})
 const supplementalNotes = ref<Record<string, string>>({})
+const orderSearch = ref('')
 const galleryPhotos = ref<GalleryPhoto[]>([])
 const galleryLoading = ref(false)
 const galleryError = ref('')
@@ -76,6 +76,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 20_000
 const UPLOAD_REQUEST_TIMEOUT_MS = 180_000
 const MAX_UPLOAD_DIMENSION = 1920
 const SUPPLEMENTAL_REQUIREMENT = '补充拍照'
+const LAST_ORDER_STORAGE_KEY = 'qc:last-opened-order'
 
 const surname = computed(() => dashboard.value?.user.name?.slice(0, 1) || '质')
 const greeting = computed(() => {
@@ -102,6 +103,23 @@ const calendarDays = computed<(Date | null)[]>(() => {
   return [...Array<Date | null>(leading).fill(null), ...Array.from({ length: count }, (_, index) => new Date(year, month, index + 1))]
 })
 const photoTransform = computed(() => `translate(${photoOffsetX.value}px, ${photoOffsetY.value}px) scale(${photoScale.value})`)
+const sortedOrders = computed(() => {
+  // Default order list is sorted newest-first within each group; completed
+  // orders stay at the end so pending work is always reachable first.
+  return [...(dashboard.value?.orders || [])].sort((left, right) => {
+    const leftDone = left.status === 'completed'
+    const rightDone = right.status === 'completed'
+    if (leftDone !== rightDone) return leftDone ? 1 : -1
+    return new Date(right.started_at).getTime() - new Date(left.started_at).getTime()
+  })
+})
+const visibleOrders = computed(() => {
+  const keyword = orderSearch.value.trim().toLowerCase()
+  if (!keyword) return sortedOrders.value
+  return sortedOrders.value.filter(order =>
+    [order.contract_no, ...order.products].some(value => String(value || '').toLowerCase().includes(keyword))
+  )
+})
 
 function formatDate(value: string) {
   const date = new Date(value)
@@ -384,11 +402,26 @@ async function openTask(recordId: string) {
   restoreSavedPhotos()
   openSubtask.value = 0
   await restoreDrafts()
+  rememberOpenedOrder(activeTask.value.contract_no)
   page.value = 'capture'
 }
 
+function rememberOpenedOrder(contractNo: string) {
+  try { window.localStorage.setItem(LAST_ORDER_STORAGE_KEY, contractNo) } catch { /* private mode: ignore */ }
+}
+
+function lastOpenedOrderContract() {
+  try { return window.localStorage.getItem(LAST_ORDER_STORAGE_KEY) || '' } catch { return '' }
+}
+
 function openFirstTask() {
-  const taskId = dashboard.value?.orders[0]?.task_ids[0]
+  const orders = sortedOrders.value
+  if (!orders.length) return
+  const remembered = orders.find(order => order.contract_no === lastOpenedOrderContract())
+  // Resume the inspector's last contract unless it is done, otherwise fall back
+  // to the topmost order (the most recent one) in the list.
+  const target = remembered && remembered.status !== 'completed' ? remembered : orders[0]
+  const taskId = target?.task_ids[0]
   if (taskId) openTask(taskId)
 }
 
@@ -604,12 +637,6 @@ function selectTask(index: number) {
   }
 }
 
-function onSwipeStart(event: TouchEvent) { touchStartX.value = event.touches[0]?.clientX || 0 }
-function onSwipeEnd(event: TouchEvent) {
-  const delta = (event.changedTouches[0]?.clientX || 0) - touchStartX.value
-  if (Math.abs(delta) > 48) selectTask(openSubtask.value + (delta < 0 ? 1 : -1))
-}
-
 onMounted(async () => {
   if (isDesktopGalleryRoute) return
   // Local draft cleanup must never delay login or the homepage, especially in
@@ -631,8 +658,10 @@ onMounted(async () => {
           <div class="greeting"><div class="avatar">{{ surname }}</div><div><p class="eyebrow">{{ greeting }}</p><h1>{{ todayText }}</h1><p class="muted">每一张照片，都让交付更有凭据。</p></div></div>
           <div class="todo-card" :class="{ interactive: dashboard?.orders.length }" role="button" :aria-disabled="!dashboard?.orders.length" :tabindex="dashboard?.orders.length ? 0 : -1" @click="openFirstTask" @keydown.enter="openFirstTask" @keydown.space.prevent="openFirstTask"><div class="card-heading"><span>我的待办</span></div><div class="todo-row"><div class="todo-icon">✓</div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
           <div class="list-title"><div><p class="eyebrow">合同任务</p><h2>待处理订单</h2></div></div>
+          <div class="gallery-search order-search"><span aria-hidden="true">⌕</span><input v-model="orderSearch" type="search" placeholder="搜索合同编号、产品、规格…" maxlength="200"><button v-if="orderSearch" aria-label="清除搜索" @click="orderSearch = ''">×</button></div>
           <p v-if="!dashboard?.orders.length" class="empty">暂无分配给你的待处理任务</p>
-          <article v-for="order in dashboard?.orders" :key="order.contract_no" class="contract-card" :class="{ completed: order.status === 'completed' }" @click="openTask(order.task_ids[0])"><div class="contract-top"><span class="status" :class="{ done: order.status === 'completed' }">{{ order.status === 'completed' ? '已完成' : '待拍摄' }}</span><span class="due">{{ formatDate(order.started_at) }}</span></div><h3>{{ order.contract_no }}</h3><div class="tag-row"><span v-for="product in order.products" :key="product">{{ product }}</span></div><div class="progress"><i :style="{ width: `${order.task_count ? (order.task_count - order.pending_count) / order.task_count * 100 : 0}%` }"/></div><footer><span>{{ order.status === 'completed' ? `已完成 ${order.task_count} / ${order.task_count} 项任务` : `剩余 ${order.pending_count} / ${order.task_count} 项任务` }}</span><b>{{ order.status === 'completed' ? '查看详情 ›' : '进入拍摄 ›' }}</b></footer></article>
+          <p v-else-if="!visibleOrders.length" class="empty">没有符合搜索条件的订单</p>
+          <article v-for="order in visibleOrders" :key="order.contract_no" class="contract-card" :class="{ completed: order.status === 'completed' }" @click="openTask(order.task_ids[0])"><div class="contract-top"><span class="status" :class="{ done: order.status === 'completed' }">{{ order.status === 'completed' ? '已完成' : '待拍摄' }}</span><span class="due">{{ formatDate(order.started_at) }}</span></div><h3>{{ order.contract_no }}</h3><div class="tag-row"><span v-for="product in order.products" :key="product">{{ product }}</span></div><div class="progress"><i :style="{ width: `${order.task_count ? (order.task_count - order.pending_count) / order.task_count * 100 : 0}%` }"/></div><footer><span>{{ order.status === 'completed' ? `已完成 ${order.task_count} / ${order.task_count} 项任务` : `剩余 ${order.pending_count} / ${order.task_count} 项任务` }}</span><b>{{ order.status === 'completed' ? '查看详情 ›' : '进入拍摄 ›' }}</b></footer></article>
         </section>
 
         <section v-else-if="page === 'capture' && activeTask" class="screen capture-screen">
@@ -640,10 +669,10 @@ onMounted(async () => {
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
           <div class="task-tab-strip"><span class="task-tabs-label">合同序号</span><div ref="taskTabs" class="task-tabs"><button v-for="(task, index) in activeTask.tasks" :key="task.feishu_record_id" :class="{ active: index === openSubtask, done: uploadedTaskIds.has(task.feishu_record_id) }" @click="selectTask(index)"><i v-if="!uploadedTaskIds.has(task.feishu_record_id)"/><span>{{ task.sequence_no?.trim() || String(index + 1) }}</span></button></div></div>
-          <p class="hint">带 <em>*</em> 的项目为必拍项；左右滑动可切换合同序号任务。</p>
+          <p class="hint">带 <em>*</em> 的项目为必拍项；点击上方合同序号可切换任务。</p>
           <p v-if="cameraError" class="camera-error">{{ cameraError }}</p>
           <p v-if="submitError" class="camera-error">{{ submitError }}</p>
-          <div class="task-swipe" @touchstart.passive="onSwipeStart" @touchend.passive="onSwipeEnd">
+          <div class="task-swipe">
             <div v-for="(task, taskIndex) in activeTask.tasks.slice(openSubtask, openSubtask + 1)" :key="task.feishu_record_id" class="capture-group open">
               <div class="group-head"><span class="component-icon">◈</span><b>{{ task.specification || '未填写规格' }} · {{ task.product_type }}</b><button v-if="uploadedTaskIds.has(task.feishu_record_id) && !editingTaskIds.has(task.feishu_record_id)" class="edit-task" @click="editTask(task.feishu_record_id)">编辑照片</button><small>{{ openSubtask + 1 }} / {{ activeTask.tasks.length }}</small></div>
               <div class="group-content">
@@ -704,7 +733,7 @@ onMounted(async () => {
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
           </div>
         </div>
-        <nav class="nav"><button :class="{ active: page === 'home' }" @click="page = 'home'"><i>⌂</i><span>首页</span></button><button :class="{ active: page === 'capture' }" @click="dashboard?.orders[0] && openTask(dashboard.orders[0].task_ids[0])"><i>◉</i><span>拍照任务</span></button><button :class="{ active: page === 'gallery' }" @click="openGallery"><i>▣</i><span>图片检索</span></button></nav>
+        <nav class="nav"><button :class="{ active: page === 'home' }" @click="page = 'home'"><i>⌂</i><span>首页</span></button><button :class="{ active: page === 'capture' }" @click="openFirstTask"><i>◉</i><span>拍照任务</span></button><button :class="{ active: page === 'gallery' }" @click="openGallery"><i>▣</i><span>图片检索</span></button></nav>
       </template>
     </div>
   </main>
@@ -722,4 +751,5 @@ onMounted(async () => {
 .todo-card.interactive{cursor:pointer;transition:transform .12s ease,box-shadow .12s ease}.todo-card.interactive:active{transform:scale(.99);box-shadow:0 2px 8px #17233c12}.todo-card:focus{outline:none}.todo-card:focus-visible{box-shadow:0 0 0 3px #3370ff26,0 5px 18px #17233c0b}.capture-topbar{display:grid;grid-template-columns:40px 1fr 40px}.capture-topbar strong{text-align:center}.capture-topbar .back{justify-self:start}.screen{padding-bottom:76px}.capture-screen{padding-bottom:190px}.bottom-action{bottom:56px}.nav{height:56px;padding-top:5px}.nav button{min-width:68px;gap:1px;font-size:10px;outline:none;border-radius:8px}.nav button:focus{outline:none}.nav button:focus-visible{background:#edf3ff;box-shadow:inset 0 0 0 2px #dce8ff}.nav i{font-size:18px;line-height:20px}@media(max-width:600px){.capture-screen{padding-bottom:calc(190px + env(safe-area-inset-bottom))}.nav{height:calc(56px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom)}.bottom-action{bottom:calc(56px + env(safe-area-inset-bottom))}}
 .nav,.nav button{-webkit-tap-highlight-color:transparent}.nav button:active,.nav button:focus,.nav button:focus-visible{outline:none!important;background:transparent!important;box-shadow:none!important}
 .capture-actions{display:grid;grid-template-columns:1fr 1fr;gap:12px}.bottom-action .save-action{background:#e8efff;color:#2862df;box-shadow:none;border:1px solid #c8d9ff}.bottom-action button.incomplete,.bottom-action button:disabled{background:#dce1e9;color:#8b95a5;box-shadow:none;border-color:transparent}
+.order-search{margin:0 0 14px}
 </style>

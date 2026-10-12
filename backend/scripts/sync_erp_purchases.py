@@ -1250,13 +1250,20 @@ def crawl_production_dailies(
     return result
 
 
-def fill_missing_inspectors(
+def refresh_inspectors(
     erp: ErpPurchaseClient,
     summaries: list[PurchaseSummary],
     purchase_codes: set[str],
     *,
     detail_workers: int,
 ) -> list[PurchaseSummary]:
+    """Load the ERP inspector for every requested contract from its detail page.
+
+    The purchase list does not carry the inspector column, so the authoritative
+    ``睿贝质检员`` value only exists on ``purchase_toUpdate``. Rows that already
+    hold a value in Bitable must be queried too, otherwise a stale value can
+    never be corrected.
+    """
     targets = [
         summary
         for summary in summaries
@@ -1271,8 +1278,8 @@ def fill_missing_inspectors(
             if inspector:
                 inspectors[summary.purchase_code] = inspector
     print(
-        f"ERP inspector detail fallback={len(inspectors)}/"
-        f"{len(targets)} orders with empty list values"
+        f"ERP inspector detail refresh={len(inspectors)}/"
+        f"{len(targets)} tracked orders queried"
     )
     return [
         replace(summary, inspector=inspectors[summary.purchase_code])
@@ -1307,7 +1314,7 @@ def find_completed_orders(
 def crawl_new_orders(
     erp: ErpPurchaseClient,
     existing_contracts: set[str],
-    missing_inspector_contracts: set[str],
+    inspector_refresh_contracts: set[str],
     *,
     limit: int | None,
     detail_workers: int,
@@ -1323,10 +1330,10 @@ def crawl_new_orders(
         for summary in summaries
         if summary.purchase_code not in existing_contracts
     }
-    summaries = fill_missing_inspectors(
+    summaries = refresh_inspectors(
         erp,
         summaries,
-        missing_inspector_contracts | new_contracts,
+        inspector_refresh_contracts | new_contracts,
         detail_workers=detail_workers,
     )
     production_dailies = crawl_production_dailies(
@@ -2047,18 +2054,11 @@ def main() -> int:
                 )
             )
         }
-        missing_inspector_contracts = {
-            contract
-            for record in tracked_order_records
-            if not _field_text(
-                (record.get("fields") or {}).get("睿贝质检员")
-            )
-            and (
-                contract := _field_text(
-                    (record.get("fields") or {}).get("合同号")
-                )
-            )
-        }
+        # Always reload 睿贝质检员 from the ERP purchase detail for every tracked
+        # contract. The purchase list never fills that column, and querying only
+        # the rows that are still empty leaves a wrongly written value stale for
+        # good, which also keeps the task assignee and the local database wrong.
+        inspector_refresh_contracts = set(tracked_contracts)
         erp = ErpPurchaseClient(
             base_url=args.base_url,
             token_file=args.token_file,
@@ -2069,7 +2069,7 @@ def main() -> int:
         orders, summaries, production_dailies, selected_count = crawl_new_orders(
             erp,
             existing_contracts,
-            missing_inspector_contracts,
+            inspector_refresh_contracts,
             limit=args.limit,
             detail_workers=args.detail_workers,
         )

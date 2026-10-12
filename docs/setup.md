@@ -381,9 +381,14 @@ Let’s Encrypt 从 2026 年起正式支持公网 IP 证书，但 IP 证书仅�
    sudo certbot reconfigure --cert-name <APP_IP> --webroot \
      --webroot-path /opt/<项目目录>/certbot-webroot \
      --preferred-profile shortlived --ip-address <APP_IP> \
-     --deploy-hook 'cd /opt/<项目目录> && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile'
+     --deploy-hook 'cd /opt/<项目目录> && docker compose --env-file .env.ip -f docker-compose.production.yml -f docker-compose.ip.yml exec -T caddy caddy reload --force --config /etc/caddy/Caddyfile --adapter caddyfile'
    sudo certbot renew --dry-run
    ```
+
+   `caddy reload` 必须带 `--force`：Caddy 在配置文件内容没有变化时会直接跳过
+   重载，而证书是通过 `tls <fullchain> <privkey>` 以文件形式加载的。若不带
+   `--force`，`certbot renew` 虽然成功签发了新证书，运行中的 Caddy 仍会继续提供
+   内存里的旧证书，最终在短时间内过期。
 
    然后设置每日续期；证书更新后 Caddy 会自动重载，过程中无需停服务：
 

@@ -57,3 +57,14 @@ http://{$APP_IP} {
         redir https://{$APP_IP}{uri} permanent
     }
 }
+
+# ── 官网（mtalloypiping.com）─────────────────────────────
+# 由营销部官网容器提供静态页面，与上方按 IP 的 QC 系统共存、互不影响。
+www.mtalloypiping.com {
+    encode gzip
+    reverse_proxy mtalloy-website-admin:80
+}
+
+mtalloypiping.com {
+    redir https://www.mtalloypiping.com{uri} permanent
+}
