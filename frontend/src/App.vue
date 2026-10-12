@@ -462,14 +462,30 @@ async function saveCapturedPhoto(taskId: string, requirement: string, image: Blo
   list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, requirement), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: imageUrl, draftId: draft.id })
 }
 
+function setH5CameraStreamEnabled(enabled: boolean) {
+  h5CameraStream?.getTracks().forEach(track => { track.enabled = enabled })
+}
+
+function handleCameraVisibilityChange() {
+  setH5CameraStreamEnabled(h5CameraOpen.value && !document.hidden)
+}
+
+function releaseH5CameraStream() {
+  h5CameraStream?.getTracks().forEach(track => track.stop())
+  h5CameraStream = null
+}
+
 function closeH5Camera() {
   h5CameraSession += 1
   h5CameraOpen.value = false
   h5CameraReady.value = false
   h5CameraTarget.value = null
-  if (h5CameraVideo.value) h5CameraVideo.value.srcObject = null
-  h5CameraStream?.getTracks().forEach(track => track.stop())
-  h5CameraStream = null
+  if (h5CameraVideo.value) {
+    h5CameraVideo.value.pause()
+    h5CameraVideo.value.srcObject = null
+  }
+  // Keep the live track for this page session so reopening does not request permission again.
+  setH5CameraStreamEnabled(false)
 }
 
 async function openFeishuCamera(taskId: string, requirement: string) {
@@ -494,12 +510,18 @@ async function addPhoto(taskId: string, requirement: string) {
   await nextTick()
   try {
     if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('当前环境不支持网页相机')
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } })
-    if (session !== h5CameraSession) {
-      stream.getTracks().forEach(track => track.stop())
-      return
+    let stream = h5CameraStream
+    if (!stream?.getVideoTracks().some(track => track.readyState === 'live')) {
+      releaseH5CameraStream()
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } })
+      if (session !== h5CameraSession) {
+        stream.getTracks().forEach(track => track.stop())
+        return
+      }
+      h5CameraStream = stream
     }
-    h5CameraStream = stream
+    if (session !== h5CameraSession) return
+    setH5CameraStreamEnabled(!document.hidden)
     const video = h5CameraVideo.value
     if (!video) throw new Error('网页相机预览不可用')
     video.srcObject = stream
@@ -511,6 +533,7 @@ async function addPhoto(taskId: string, requirement: string) {
     if (session !== h5CameraSession) return
     console.warn('H5 camera unavailable; using Feishu camera', cause)
     closeH5Camera()
+    releaseH5CameraStream()
     cameraError.value = '网页相机启动失败，已切换飞书相机'
     await openFeishuCamera(taskId, requirement)
   }
@@ -547,6 +570,7 @@ async function takeH5Photo() {
 async function switchToFeishuCamera() {
   const target = h5CameraTarget.value
   closeH5Camera()
+  releaseH5CameraStream()
   if (target) await openFeishuCamera(target.taskId, target.requirement)
 }
 
@@ -725,12 +749,17 @@ function selectTask(index: number) {
 
 onMounted(async () => {
   if (isDesktopGalleryRoute) return
+  document.addEventListener('visibilitychange', handleCameraVisibilityChange)
   // Local draft cleanup must never delay login or the homepage, especially in
   // iOS WebViews where IndexedDB may be unavailable.
   void cleanExpiredDrafts()
   try { await loadDashboard() } catch (cause) { error.value = cause instanceof Error ? cause.message : '加载失败' } finally { isLoading.value = false }
 })
-onUnmounted(closeH5Camera)
+onUnmounted(() => {
+  document.removeEventListener('visibilitychange', handleCameraVisibilityChange)
+  closeH5Camera()
+  releaseH5CameraStream()
+})
 </script>
 
 <template>
@@ -822,7 +851,7 @@ onUnmounted(closeH5Camera)
         </div>
         <div v-if="h5CameraOpen" class="h5-camera" role="dialog" aria-modal="true" aria-label="拍照">
           <header class="h5-camera-header"><button :disabled="h5CameraPending > 0" aria-label="关闭相机" @click="closeH5Camera">×</button><div><b>{{ h5CameraTarget?.requirement }}</b><small>已保存 {{ h5CameraShotCount }} 张<span v-if="h5CameraPending"> · 正在保存 {{ h5CameraPending }} 张</span></small></div><span/></header>
-          <div class="h5-camera-preview"><video ref="h5CameraVideo" autoplay muted playsinline webkit-playsinline></video><p v-if="!h5CameraReady">正在启动相机…</p></div>
+          <div class="h5-camera-preview"><video ref="h5CameraVideo" :class="{ ready: h5CameraReady }" autoplay muted playsinline webkit-playsinline></video><p v-if="!h5CameraReady">正在启动相机…</p></div>
           <p v-if="cameraError" class="h5-camera-error">{{ cameraError }}</p>
           <footer class="h5-camera-actions"><button class="h5-camera-alternative" :disabled="h5CameraPending > 0" @click="switchToFeishuCamera">飞书相机</button><button class="h5-camera-shutter" :disabled="!h5CameraReady || h5CameraPending >= 3" aria-label="拍照" @click="takeH5Photo"><span/></button><button class="h5-camera-done" :disabled="h5CameraPending > 0" @click="closeH5Camera">完成</button></footer>
         </div>
@@ -845,5 +874,24 @@ onUnmounted(closeH5Camera)
 .nav,.nav button{-webkit-tap-highlight-color:transparent}.nav button:active,.nav button:focus,.nav button:focus-visible{outline:none!important;background:transparent!important;box-shadow:none!important}
 .capture-actions{display:grid;grid-template-columns:1fr 1fr;gap:12px}.bottom-action .save-action{background:#e8efff;color:#2862df;box-shadow:none;border:1px solid #c8d9ff}.bottom-action button.incomplete,.bottom-action button:disabled{background:#dce1e9;color:#8b95a5;box-shadow:none;border-color:transparent}
 .order-search{margin:0 0 14px}
-.capture-screen.camera-visible{overflow:hidden}.h5-camera{position:absolute;z-index:60;inset:0;display:flex;flex-direction:column;background:#101318;color:#fff}.h5-camera-header{height:64px;display:grid;grid-template-columns:52px 1fr 52px;align-items:center;padding:6px 8px;padding-top:max(6px,env(safe-area-inset-top));background:#171d24}.h5-camera-header button{color:#fff;font-size:32px;line-height:1}.h5-camera-header div{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}.h5-camera-header b{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}.h5-camera-header small{font-size:11px;color:#c3cad2}.h5-camera-preview{position:relative;flex:1;min-height:0;display:grid;place-items:center;background:#050607}.h5-camera-preview video{width:100%;height:100%;object-fit:contain}.h5-camera-preview p{position:absolute;bottom:16px;padding:7px 12px;border-radius:15px;background:#0009;font-size:12px}.h5-camera-error{margin:0;padding:8px 12px;background:#9b2b2b;color:#fff;font-size:12px;text-align:center}.h5-camera-actions{height:112px;padding:12px 18px calc(16px + env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 88px 1fr;align-items:center;gap:8px;background:#171d24}.h5-camera-actions button:disabled{opacity:.5}.h5-camera-alternative,.h5-camera-done{color:#fff;font-size:13px}.h5-camera-alternative{justify-self:start}.h5-camera-done{justify-self:end}.h5-camera-shutter{width:72px;height:72px;border:4px solid #fff;border-radius:50%;display:grid;place-items:center;justify-self:center}.h5-camera-shutter span{width:54px;height:54px;border-radius:50%;background:#fff}.h5-camera-shutter:active span{transform:scale(.88)}
+.capture-screen.camera-visible{overflow:hidden}
+.h5-camera{position:absolute;z-index:60;inset:0;display:flex;flex-direction:column;min-height:0;overflow:hidden;background:#101318;color:#fff}
+.h5-camera-header{flex:none;height:64px;display:grid;grid-template-columns:52px 1fr 52px;align-items:center;padding:6px 8px;padding-top:max(6px,env(safe-area-inset-top));background:#171d24}
+.h5-camera-header button{color:#fff;font-size:32px;line-height:1}
+.h5-camera-header div{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}
+.h5-camera-header b{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
+.h5-camera-header small{font-size:11px;color:#c3cad2}
+.h5-camera-preview{position:relative;flex:1 1 0;min-height:0;overflow:hidden;background:#050607}
+.h5-camera-preview video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain;opacity:0}
+.h5-camera-preview video.ready{opacity:1}
+.h5-camera-preview p{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);white-space:nowrap;padding:7px 12px;border-radius:15px;background:#0009;font-size:12px}
+.h5-camera-error{flex:none;margin:0;padding:8px 12px;background:#9b2b2b;color:#fff;font-size:12px;text-align:center}
+.h5-camera-actions{flex:none;height:112px;padding:12px 18px calc(16px + env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 88px 1fr;align-items:center;gap:8px;background:#171d24}
+.h5-camera-actions button:disabled{opacity:.5}
+.h5-camera-alternative,.h5-camera-done{color:#fff;font-size:13px}
+.h5-camera-alternative{justify-self:start}
+.h5-camera-done{justify-self:end}
+.h5-camera-shutter{width:72px;height:72px;border:4px solid #fff;border-radius:50%;display:grid;place-items:center;justify-self:center}
+.h5-camera-shutter span{width:54px;height:54px;border-radius:50%;background:#fff}
+.h5-camera-shutter:active span{transform:scale(.88)}
 </style>
