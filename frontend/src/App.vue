@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import DesktopGallery from './DesktopGallery.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
 
@@ -31,6 +31,14 @@ const error = ref('')
 const openSubtask = ref(0)
 const photos = ref<Record<string, Photo[]>>({})
 const cameraError = ref('')
+const h5CameraOpen = ref(false)
+const h5CameraReady = ref(false)
+const h5CameraPending = ref(0)
+const h5CameraVideo = ref<HTMLVideoElement | null>(null)
+const h5CameraTarget = ref<{ taskId: string; requirement: string } | null>(null)
+const h5CameraShotCount = ref(0)
+let h5CameraStream: MediaStream | null = null
+let h5CameraSession = 0
 const submitError = ref('')
 const isSubmitting = ref(false)
 const submitMode = ref<'save' | 'complete'>('complete')
@@ -443,25 +451,103 @@ async function configureFeishuJsapi() {
   try { await jsapiReady } catch (error) { jsapiReady = null; throw error }
 }
 
-async function addPhoto(taskId: string, requirement: string) {
-  cameraError.value = ''
+async function saveCapturedPhoto(taskId: string, requirement: string, image: Blob, capturedAt: string) {
+  const task = activeTask.value?.tasks.find(item => item.feishu_record_id === taskId)
+  if (!task || !activeTask.value) throw new Error('拍照任务已失效，请返回后重新进入')
+  const optimized = await optimizePhotoForUpload(image)
+  const draft: PhotoDraft = { id: crypto.randomUUID(), contractNo: activeTask.value.contract_no, taskId, inspectionItem: requirement, inspectionNote: requirement === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', capturedAt, image: optimized, createdAt: Date.now() }
+  await saveDraft(draft)
+  const imageUrl = draftPreview(draft)
+  const list = photos.value[photoKey(taskId, requirement)] ||= []
+  list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, requirement), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: imageUrl, draftId: draft.id })
+}
+
+function closeH5Camera() {
+  h5CameraSession += 1
+  h5CameraOpen.value = false
+  h5CameraReady.value = false
+  h5CameraTarget.value = null
+  if (h5CameraVideo.value) h5CameraVideo.value.srcObject = null
+  h5CameraStream?.getTracks().forEach(track => track.stop())
+  h5CameraStream = null
+}
+
+async function openFeishuCamera(taskId: string, requirement: string) {
   try {
     await configureFeishuJsapi()
     const result = await new Promise<FeishuChooseImageResult>((resolve, reject) => window.tt!.chooseImage({ count: 1, sourceType: ['camera'], sizeType: ['compressed'], success: resolve, fail: reject }))
     const localPath = result.tempFilePaths?.[0] || result.localIds?.[0]
     if (!localPath) return
-    const task = activeTask.value?.tasks.find(item => item.feishu_record_id === taskId)
-    if (!task || !activeTask.value) throw new Error('拍照任务已失效，请返回后重新进入')
-    const image = await optimizePhotoForUpload(await readTemporaryPhoto(localPath))
-    const capturedAt = new Date().toISOString()
-    const draft: PhotoDraft = { id: crypto.randomUUID(), contractNo: activeTask.value.contract_no, taskId, inspectionItem: requirement, inspectionNote: requirement === SUPPLEMENTAL_REQUIREMENT ? supplementalNotes.value[taskId] || '' : '', capturedAt, image, createdAt: Date.now() }
-    await saveDraft(draft)
-    const imageUrl = draftPreview(draft)
-    const list = photos.value[photoKey(taskId, requirement)] ||= []
-    list.push({ name: buildPhotoName(activeTask.value.contract_no, task.specification, task.product_type, requirement), tone: ['steel-a', 'steel-b', 'steel-c'][list.length % 3], url: imageUrl, draftId: draft.id })
+    await saveCapturedPhoto(taskId, requirement, await readTemporaryPhoto(localPath), new Date().toISOString())
   } catch (cause) {
     cameraError.value = cameraFailureMessage(cause)
   }
+}
+
+async function addPhoto(taskId: string, requirement: string) {
+  cameraError.value = ''
+  h5CameraTarget.value = { taskId, requirement }
+  h5CameraShotCount.value = 0
+  h5CameraOpen.value = true
+  h5CameraReady.value = false
+  const session = ++h5CameraSession
+  await nextTick()
+  try {
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new Error('当前环境不支持网页相机')
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } } })
+    if (session !== h5CameraSession) {
+      stream.getTracks().forEach(track => track.stop())
+      return
+    }
+    h5CameraStream = stream
+    const video = h5CameraVideo.value
+    if (!video) throw new Error('网页相机预览不可用')
+    video.srcObject = stream
+    await video.play()
+    if (session !== h5CameraSession) return
+    if (!video.videoWidth || !video.videoHeight) throw new Error('网页相机没有提供画面')
+    h5CameraReady.value = true
+  } catch (cause) {
+    if (session !== h5CameraSession) return
+    console.warn('H5 camera unavailable; using Feishu camera', cause)
+    closeH5Camera()
+    cameraError.value = '网页相机启动失败，已切换飞书相机'
+    await openFeishuCamera(taskId, requirement)
+  }
+}
+
+async function takeH5Photo() {
+  if (!h5CameraReady.value || h5CameraPending.value >= 3 || !h5CameraTarget.value || !h5CameraVideo.value) return
+  const video = h5CameraVideo.value
+  const target = h5CameraTarget.value
+  const capturedAt = new Date().toISOString()
+  const session = h5CameraSession
+  cameraError.value = ''
+  h5CameraPending.value += 1
+  try {
+    const scale = Math.min(1, MAX_UPLOAD_DIMENSION / Math.max(video.videoWidth, video.videoHeight))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale))
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale))
+    const context = canvas.getContext('2d')
+    if (!context) throw new Error('无法生成照片')
+    context.drawImage(video, 0, 0, canvas.width, canvas.height)
+    const image = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', .9))
+    if (!image) throw new Error('无法生成照片')
+    if (session !== h5CameraSession) return
+    await saveCapturedPhoto(target.taskId, target.requirement, image, capturedAt)
+    if (session === h5CameraSession) h5CameraShotCount.value += 1
+  } catch (cause) {
+    cameraError.value = cause instanceof Error ? cause.message : '照片保存失败，请重试'
+  } finally {
+    h5CameraPending.value -= 1
+  }
+}
+
+async function switchToFeishuCamera() {
+  const target = h5CameraTarget.value
+  closeH5Camera()
+  if (target) await openFeishuCamera(target.taskId, target.requirement)
 }
 
 function cameraFailureMessage(cause: unknown) {
@@ -644,6 +730,7 @@ onMounted(async () => {
   void cleanExpiredDrafts()
   try { await loadDashboard() } catch (cause) { error.value = cause instanceof Error ? cause.message : '加载失败' } finally { isLoading.value = false }
 })
+onUnmounted(closeH5Camera)
 </script>
 
 <template>
@@ -664,7 +751,7 @@ onMounted(async () => {
           <article v-for="order in visibleOrders" :key="order.contract_no" class="contract-card" :class="{ completed: order.status === 'completed' }" @click="openTask(order.task_ids[0])"><div class="contract-top"><span class="status" :class="{ done: order.status === 'completed' }">{{ order.status === 'completed' ? '已完成' : '待拍摄' }}</span><span class="due">{{ formatDate(order.started_at) }}</span></div><h3>{{ order.contract_no }}</h3><div class="tag-row"><span v-for="product in order.products" :key="product">{{ product }}</span></div><div class="progress"><i :style="{ width: `${order.task_count ? (order.task_count - order.pending_count) / order.task_count * 100 : 0}%` }"/></div><footer><span>{{ order.status === 'completed' ? `已完成 ${order.task_count} / ${order.task_count} 项任务` : `剩余 ${order.pending_count} / ${order.task_count} 项任务` }}</span><b>{{ order.status === 'completed' ? '查看详情 ›' : '进入拍摄 ›' }}</b></footer></article>
         </section>
 
-        <section v-else-if="page === 'capture' && activeTask" class="screen capture-screen">
+        <section v-else-if="page === 'capture' && activeTask" class="screen capture-screen" :class="{ 'camera-visible': h5CameraOpen }">
           <header class="topbar capture-topbar"><button class="back" @click="page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
@@ -733,6 +820,12 @@ onMounted(async () => {
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
           </div>
         </div>
+        <div v-if="h5CameraOpen" class="h5-camera" role="dialog" aria-modal="true" aria-label="拍照">
+          <header class="h5-camera-header"><button :disabled="h5CameraPending > 0" aria-label="关闭相机" @click="closeH5Camera">×</button><div><b>{{ h5CameraTarget?.requirement }}</b><small>已保存 {{ h5CameraShotCount }} 张<span v-if="h5CameraPending"> · 正在保存 {{ h5CameraPending }} 张</span></small></div><span/></header>
+          <div class="h5-camera-preview"><video ref="h5CameraVideo" autoplay muted playsinline webkit-playsinline></video><p v-if="!h5CameraReady">正在启动相机…</p></div>
+          <p v-if="cameraError" class="h5-camera-error">{{ cameraError }}</p>
+          <footer class="h5-camera-actions"><button class="h5-camera-alternative" :disabled="h5CameraPending > 0" @click="switchToFeishuCamera">飞书相机</button><button class="h5-camera-shutter" :disabled="!h5CameraReady || h5CameraPending >= 3" aria-label="拍照" @click="takeH5Photo"><span/></button><button class="h5-camera-done" :disabled="h5CameraPending > 0" @click="closeH5Camera">完成</button></footer>
+        </div>
         <nav class="nav"><button :class="{ active: page === 'home' }" @click="page = 'home'"><i>⌂</i><span>首页</span></button><button :class="{ active: page === 'capture' }" @click="openFirstTask"><i>◉</i><span>拍照任务</span></button><button :class="{ active: page === 'gallery' }" @click="openGallery"><i>▣</i><span>图片检索</span></button></nav>
       </template>
     </div>
@@ -752,4 +845,5 @@ onMounted(async () => {
 .nav,.nav button{-webkit-tap-highlight-color:transparent}.nav button:active,.nav button:focus,.nav button:focus-visible{outline:none!important;background:transparent!important;box-shadow:none!important}
 .capture-actions{display:grid;grid-template-columns:1fr 1fr;gap:12px}.bottom-action .save-action{background:#e8efff;color:#2862df;box-shadow:none;border:1px solid #c8d9ff}.bottom-action button.incomplete,.bottom-action button:disabled{background:#dce1e9;color:#8b95a5;box-shadow:none;border-color:transparent}
 .order-search{margin:0 0 14px}
+.capture-screen.camera-visible{overflow:hidden}.h5-camera{position:absolute;z-index:60;inset:0;display:flex;flex-direction:column;background:#101318;color:#fff}.h5-camera-header{height:64px;display:grid;grid-template-columns:52px 1fr 52px;align-items:center;padding:6px 8px;padding-top:max(6px,env(safe-area-inset-top));background:#171d24}.h5-camera-header button{color:#fff;font-size:32px;line-height:1}.h5-camera-header div{display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}.h5-camera-header b{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}.h5-camera-header small{font-size:11px;color:#c3cad2}.h5-camera-preview{position:relative;flex:1;min-height:0;display:grid;place-items:center;background:#050607}.h5-camera-preview video{width:100%;height:100%;object-fit:contain}.h5-camera-preview p{position:absolute;bottom:16px;padding:7px 12px;border-radius:15px;background:#0009;font-size:12px}.h5-camera-error{margin:0;padding:8px 12px;background:#9b2b2b;color:#fff;font-size:12px;text-align:center}.h5-camera-actions{height:112px;padding:12px 18px calc(16px + env(safe-area-inset-bottom));display:grid;grid-template-columns:1fr 88px 1fr;align-items:center;gap:8px;background:#171d24}.h5-camera-actions button:disabled{opacity:.5}.h5-camera-alternative,.h5-camera-done{color:#fff;font-size:13px}.h5-camera-alternative{justify-self:start}.h5-camera-done{justify-self:end}.h5-camera-shutter{width:72px;height:72px;border:4px solid #fff;border-radius:50%;display:grid;place-items:center;justify-self:center}.h5-camera-shutter span{width:54px;height:54px;border-radius:50%;background:#fff}.h5-camera-shutter:active span{transform:scale(.88)}
 </style>
