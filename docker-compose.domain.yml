@@ -1,0 +1,17 @@
+# Domain-mode override for docker-compose.production.yml.
+#
+# The shared edge proxy owns host ports 80/443. QC keeps its Caddy container
+# only as an internal HTTP web server on qc_capture_system_default.
+services:
+  api:
+    environment:
+      # Keep Feishu JSAPI signatures and browser calls on the public domain.
+      WEB_ORIGIN: ${APP_ORIGIN:?Set APP_ORIGIN in .env.domain}
+
+  caddy:
+    container_name: qc-capture-web
+    ports: !override []
+    expose:
+      - "80"
+    volumes:
+      - ./Caddyfile.internal:/etc/caddy/Caddyfile:ro

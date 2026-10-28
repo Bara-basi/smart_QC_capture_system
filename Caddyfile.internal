@@ -1,0 +1,41 @@
+{
+	# TLS ends at the shared edge proxy. This instance only serves HTTP to
+	# containers attached to qc_capture_system_default.
+	auto_https off
+}
+
+:80 {
+	request_body {
+		max_size 100MB
+	}
+
+	handle /api/* {
+		reverse_proxy api:8000 {
+			header_up Host {host}
+			# Preserve the client information supplied by the trusted edge.
+			header_up X-Real-IP {header.X-Real-IP}
+			header_up X-Forwarded-Proto {header.X-Forwarded-Proto}
+		}
+	}
+
+	handle /health {
+		reverse_proxy api:8000 {
+			header_up Host {host}
+			header_up X-Real-IP {header.X-Real-IP}
+			header_up X-Forwarded-Proto {header.X-Forwarded-Proto}
+		}
+	}
+
+	handle /assets/* {
+		header Cache-Control "public, max-age=31536000, immutable"
+		root * /srv
+		file_server
+	}
+
+	handle {
+		header Cache-Control "no-cache"
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

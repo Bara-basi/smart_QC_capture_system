@@ -215,6 +215,26 @@ sudo usermod -aG docker "$USER" # 重新登录后可免 sudo 使用 docker
 
 Caddy 会在域名正确解析、80/443 可访问后自动申请和续期 Let's Encrypt 证书。若服务器已有 Nginx/Apache 占用 80 或 443，应停用它，或改由现有反代转发至 Caddy。
 
+### 多项目共享域名入口
+
+当同一台服务器需要同时部署 QC、`mtalloy-admin` 和 `mtalloy-website` 时，不应让
+某个业务项目的 Caddy 独占 `80/443`。项目已提供共享入口配置：
+
+```text
+deploy/shared-edge/
+```
+
+共享入口按域名分别转发：
+
+- `QC_DOMAIN` → QC 内部 Web 容器 `qc-capture-web:80`
+- `ADMIN_DOMAIN` → `mtalloy-website-admin:80`
+- `WEBSITE_DOMAIN` → `mtalloy-website:80`
+
+QC 使用 `docker-compose.domain.yml` 接管 `docker-compose.production.yml` 中 Caddy
+的端口映射，并改用 `Caddyfile.internal`。切换后 QC 容器不发布宿主机 `80/443`，
+宿主机端口只由共享入口持有。完整配置、验收与回滚步骤见
+[`deploy/shared-edge/README.md`](../deploy/shared-edge/README.md)。
+
 ### 无域名（公网 IP）模式
 
 可使用固定公网 IP，例如 `https://203.0.113.10`，不需要购买域名。当前 IP 部署
