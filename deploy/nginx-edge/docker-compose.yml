@@ -1,0 +1,40 @@
+name: mtsco-edge
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: mtsco-edge-nginx
+    restart: unless-stopped
+    read_only: true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./conf.d:/etc/nginx/conf.d:ro
+      - ./snippets:/etc/nginx/snippets:ro
+      # Reuse the existing Certbot webroot so the short-lived IP certificate
+      # can keep renewing after Caddy stops owning the public ports.
+      - ../../certbot-webroot:/var/www/certbot:ro
+      - ./certs:/etc/nginx/certs:ro
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+    networks:
+      - shared
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  shared:
+    external: true
+    name: qc_capture_system_default

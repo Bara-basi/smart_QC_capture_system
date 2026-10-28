@@ -1,0 +1,8 @@
+# Test the complete edge on unprivileged host ports without touching the live
+# Caddy listeners. Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d
+services:
+  nginx:
+    ports: !override
+      - "127.0.0.1:28080:80"
+      - "127.0.0.1:28443:443"
