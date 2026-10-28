@@ -27,6 +27,13 @@ def delete_image(bucket_name: str, object_key: str) -> None:
     oss2.Bucket(auth, settings.oss_endpoint, bucket_name).delete_object(object_key)
 
 
+def read_image(bucket_name: str, object_key: str) -> bytes:
+    if not all((settings.oss_endpoint, settings.oss_access_key_id.strip(), settings.oss_access_key_secret.strip(), bucket_name)):
+        raise OssError("Aliyun OSS is not configured")
+    auth = oss2.Auth(settings.oss_access_key_id.strip(), settings.oss_access_key_secret.strip())
+    return oss2.Bucket(auth, settings.oss_endpoint, bucket_name).get_object(object_key).read()
+
+
 def signed_download_url(bucket_name: str, object_key: str, expires_in: int = 300, download_name: str | None = None) -> str:
     auth = oss2.Auth(settings.oss_access_key_id.strip(), settings.oss_access_key_secret.strip())
     params = {"response-content-disposition": f'attachment; filename="{download_name}"'} if download_name else None

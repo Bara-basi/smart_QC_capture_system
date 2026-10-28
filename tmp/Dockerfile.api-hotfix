@@ -1,0 +1,8 @@
+FROM qc_capture_system-api@sha256:8aa827e2c5d5573909d8bcfd3d6bd6238ac95dc49e672ac46ca00226cbea9fd6
+
+WORKDIR /app
+COPY app ./app
+COPY scripts ./scripts
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips=*"]

@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -424,6 +425,43 @@ async def photo_object_for_user(user_id: str, photo_id: str, preview: bool, scop
         if not row or not row["object_key"]:
             raise LookupError("Photo not found")
         return str(row["object_key"])
+    finally:
+        await connection.close()
+
+
+async def photo_downloads_for_user(
+    user_id: str, photo_ids: list[str], scope: str = "mine"
+) -> list[asyncpg.Record]:
+    """Return downloadable originals in caller order after an authorization check."""
+    if scope not in {"mine", "shared"}:
+        raise ValueError("Invalid photo scope")
+    if not photo_ids:
+        raise ValueError("Select at least one photo")
+    if len(photo_ids) > 200:
+        raise ValueError("At most 200 photos can be downloaded at once")
+    try:
+        ordered_ids = list(dict.fromkeys(str(UUID(photo_id)) for photo_id in photo_ids))
+    except ValueError as exc:
+        raise ValueError("Invalid photo ID") from exc
+
+    connection = await asyncpg.connect(_dsn())
+    try:
+        rows = await connection.fetch(
+            """SELECT p.id::text AS id, p.oss_object_key, p.contract_no, p.product_type,
+                      p.specification, p.inspection_item, p.captured_at,
+                      p.content_type, p.file_size_bytes
+               FROM photo_records p
+               JOIN users u ON u.id = $1::uuid
+               WHERE p.id = ANY($2::uuid[])
+                 AND ($3 = 'shared' OR p.photographer_open_id = u.open_id)""",
+            user_id,
+            ordered_ids,
+            scope,
+        )
+        rows_by_id = {str(row["id"]): row for row in rows}
+        if len(rows_by_id) != len(ordered_ids):
+            raise LookupError("One or more photos are unavailable")
+        return [rows_by_id[photo_id] for photo_id in ordered_ids]
     finally:
         await connection.close()
 
