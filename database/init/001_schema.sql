@@ -89,6 +89,7 @@ CREATE TABLE photo_records (
     specification TEXT,
     photographer_name VARCHAR(100),
     oss_object_key TEXT NOT NULL UNIQUE,
+    original_oss_object_key TEXT UNIQUE,
     preview_oss_object_key TEXT NOT NULL UNIQUE,
     original_filename TEXT,
     content_type VARCHAR(100) NOT NULL DEFAULT 'image/jpeg',

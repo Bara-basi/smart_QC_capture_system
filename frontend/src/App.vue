@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import DesktopGallery from './DesktopGallery.vue'
+import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
 
 type Order = { contract_no: string; started_at: string; task_count: number; pending_count: number; status: string; products: string[]; task_ids: string[] }
@@ -10,8 +11,8 @@ type ProductTask = { feishu_record_id: string; product_type: string; specificati
 type CaptureTask = { contract_no: string; tasks: ProductTask[] }
 type Dashboard = { user: { name: string }; pending_task_count: number; orders: Order[] }
 type Photo = { name: string; tone: string; url: string; draftId?: string; recordId?: string }
-type GalleryPhoto = { id: string; name: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string }
-type GalleryResponse = { photos: GalleryPhoto[]; count: number }
+type GalleryPhoto = { id: string; name: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string; has_unwatermarked: boolean }
+type GalleryResponse = { photos: GalleryPhoto[]; count: number; page: number; page_size: number; total_pages: number }
 type FeishuChooseImageResult = { tempFilePaths?: string[]; localIds?: string[] }
 type FileSystemManager = { readFile: (options: { filePath: string; encoding?: 'base64'; success: (result: { data: string | ArrayBuffer }) => void; fail: (error: unknown) => void }) => void }
 
@@ -50,6 +51,14 @@ const editBaselinePhotoIds = ref<Record<string, string[]>>({})
 const supplementalNotes = ref<Record<string, string>>({})
 const orderSearch = ref('')
 const galleryPhotos = ref<GalleryPhoto[]>([])
+const galleryTotal = ref(0)
+const galleryPage = ref(1)
+const galleryTotalPages = ref(0)
+const galleryPageSize = 50
+const selectedGalleryPhotoIds = ref<Set<string>>(new Set())
+const downloadDialogOpen = ref(false)
+const downloadWithWatermark = ref(true)
+const pendingDownloadIds = ref<string[]>([])
 const galleryLoading = ref(false)
 const galleryError = ref('')
 const galleryProduct = ref('')
@@ -66,6 +75,7 @@ const fullPhotoLoaded = ref(false)
 const photoScale = ref(1)
 const photoOffsetX = ref(0)
 const photoOffsetY = ref(0)
+const photoRotation = ref(0)
 const photoDragging = ref(false)
 const viewerImage = ref<HTMLImageElement | null>(null)
 const activePhotoPointers = new Map<number, { x: number; y: number }>()
@@ -110,7 +120,14 @@ const calendarDays = computed<(Date | null)[]>(() => {
   const count = new Date(year, month + 1, 0).getDate()
   return [...Array<Date | null>(leading).fill(null), ...Array.from({ length: count }, (_, index) => new Date(year, month, index + 1))]
 })
-const photoTransform = computed(() => `translate(${photoOffsetX.value}px, ${photoOffsetY.value}px) scale(${photoScale.value})`)
+const photoTransform = computed(() => `translate(${photoOffsetX.value}px, ${photoOffsetY.value}px) scale(${photoScale.value}) rotate(${photoRotation.value}deg)`)
+const galleryPageNumbers = computed(() => {
+  const count = Math.min(5, galleryTotalPages.value)
+  const start = Math.max(1, Math.min(galleryPage.value - 2, galleryTotalPages.value - count + 1))
+  return Array.from({ length: count }, (_, index) => start + index)
+})
+const selectedGalleryPhotos = computed(() => galleryPhotos.value.filter(photo => selectedGalleryPhotoIds.value.has(photo.id)))
+const unavailableGalleryOriginals = computed(() => selectedGalleryPhotos.value.filter(photo => !photo.has_unwatermarked).length)
 const sortedOrders = computed(() => {
   // Default order list is sorted newest-first within each group; completed
   // orders stay at the end so pending work is always reachable first.
@@ -166,17 +183,27 @@ function galleryDate(value: string) {
   return Number.isNaN(date.valueOf()) ? '未知时间' : date.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
 }
 
-async function loadGallery() {
+async function loadGallery(resetPage = true) {
   galleryLoading.value = true
   galleryError.value = ''
   try {
-    const query = new URLSearchParams({ sort: gallerySort.value, scope: galleryScope.value })
+    if (resetPage) galleryPage.value = 1
+    const query = new URLSearchParams({
+      sort: gallerySort.value,
+      scope: galleryScope.value,
+      page: String(galleryPage.value),
+      page_size: String(galleryPageSize),
+    })
     if (galleryProduct.value) query.set('product_type', galleryProduct.value)
     if (galleryPart.value) query.set('inspection_category', galleryPart.value)
     if (galleryFrom.value) query.set('captured_from', galleryFrom.value)
     if (galleryTo.value) query.set('captured_to', galleryTo.value)
     if (gallerySearch.value.trim()) query.set('q', gallerySearch.value.trim())
-    galleryPhotos.value = (await request<GalleryResponse>(`/api/v1/photos?${query}`)).photos
+    const data = await request<GalleryResponse>(`/api/v1/photos?${query}`)
+    galleryPhotos.value = data.photos
+    galleryTotal.value = data.count
+    galleryTotalPages.value = data.total_pages
+    if (resetPage) selectedGalleryPhotoIds.value = new Set()
   } catch (cause) {
     galleryError.value = cause instanceof Error ? cause.message : '图片加载失败'
   } finally { galleryLoading.value = false }
@@ -276,12 +303,14 @@ function galleryPhotoUrl(photo: GalleryPhoto, kind: 'preview' | 'full' | 'downlo
 function openGalleryPhoto(photo: GalleryPhoto) {
   selectedGalleryPhoto.value = photo
   fullPhotoLoaded.value = false
+  photoRotation.value = 0
   resetPhotoZoom()
 }
 
 function closeGalleryPhoto() {
   selectedGalleryPhoto.value = null
   resetPhotoZoom()
+  photoRotation.value = 0
 }
 
 function resetPhotoZoom() {
@@ -294,6 +323,12 @@ function resetPhotoZoom() {
 
 function clampScale(value: number) {
   return Math.min(5, Math.max(1, value))
+}
+
+function rotateGalleryPhoto() {
+  photoRotation.value = (photoRotation.value + 90) % 360
+  photoOffsetX.value = 0
+  photoOffsetY.value = 0
 }
 
 function pointerDistance(first: { x: number; y: number }, second: { x: number; y: number }) {
@@ -311,8 +346,11 @@ function clampPhotoOffsets(stage: HTMLElement) {
     photoOffsetY.value = 0
     return
   }
-  const maxX = Math.max(0, (image.clientWidth * photoScale.value - stage.clientWidth) / 2)
-  const maxY = Math.max(0, (image.clientHeight * photoScale.value - stage.clientHeight) / 2)
+  const quarterTurn = photoRotation.value % 180 !== 0
+  const renderedWidth = (quarterTurn ? image.clientHeight : image.clientWidth) * photoScale.value
+  const renderedHeight = (quarterTurn ? image.clientWidth : image.clientHeight) * photoScale.value
+  const maxX = Math.max(0, (renderedWidth - stage.clientWidth) / 2)
+  const maxY = Math.max(0, (renderedHeight - stage.clientHeight) / 2)
   photoOffsetX.value = Math.min(maxX, Math.max(-maxX, photoOffsetX.value))
   photoOffsetY.value = Math.min(maxY, Math.max(-maxY, photoOffsetY.value))
 }
@@ -399,6 +437,55 @@ function stopPhotoGesture(event: PointerEvent) {
 async function openGallery() {
   page.value = 'gallery'
   await loadGallery()
+}
+
+function toggleGalleryPhoto(photoId: string) {
+  const next = new Set(selectedGalleryPhotoIds.value)
+  if (next.has(photoId)) next.delete(photoId)
+  else next.add(photoId)
+  selectedGalleryPhotoIds.value = next
+}
+
+function toggleGalleryPageSelection() {
+  const next = new Set(selectedGalleryPhotoIds.value)
+  const allSelected = galleryPhotos.value.every(photo => next.has(photo.id))
+  for (const photo of galleryPhotos.value) {
+    if (allSelected) next.delete(photo.id)
+    else next.add(photo.id)
+  }
+  selectedGalleryPhotoIds.value = next
+}
+
+async function goToGalleryPage(nextPage: number) {
+  if (nextPage < 1 || nextPage > galleryTotalPages.value || nextPage === galleryPage.value) return
+  galleryPage.value = nextPage
+  selectedGalleryPhotoIds.value = new Set()
+  await loadGallery(false)
+  document.querySelector('.gallery-screen')?.scrollTo({ top: 0, behavior: 'smooth' })
+}
+
+function openDownload(ids: string[]) {
+  if (!ids.length) return
+  pendingDownloadIds.value = ids
+  downloadWithWatermark.value = true
+  downloadDialogOpen.value = true
+}
+
+function confirmDownload() {
+  const ids = pendingDownloadIds.value
+  if (!ids.length) return
+  const query = new URLSearchParams({ scope: galleryScope.value, watermarked: String(downloadWithWatermark.value) })
+  if (ids.length === 1) {
+    const link = document.createElement('a')
+    link.href = `/api/v1/feishu/photos/${ids[0]}/download?${query}`
+    link.download = ''
+    link.click()
+  } else {
+    for (const id of ids) query.append('photo_ids', id)
+    window.location.assign(`/api/v1/feishu/photos/download-batch?${query}`)
+  }
+  selectedGalleryPhotoIds.value = new Set()
+  downloadDialogOpen.value = false
 }
 
 async function openTask(recordId: string) {
@@ -814,7 +901,7 @@ onUnmounted(() => {
         <section v-else class="screen gallery-screen">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>图片检索</strong><span class="header-space"/></header>
           <div class="tabs gallery-tabs"><button :class="{ active: galleryScope === 'mine' }" @click="selectGalleryScope('mine')">我拍摄的</button><button :class="{ active: galleryScope === 'shared' }" @click="selectGalleryScope('shared')">与我共享</button></div>
-          <div class="gallery-search"><span aria-hidden="true">⌕</span><input v-model="gallerySearch" type="search" placeholder="搜索合同、产品、规格、部位…" maxlength="200" @input="scheduleGallerySearch" @keyup.enter="loadGallery"><button v-if="gallerySearch" aria-label="清除搜索" @click="clearGallerySearch">×</button></div>
+          <div class="gallery-search"><span aria-hidden="true">⌕</span><input v-model="gallerySearch" type="search" placeholder="搜索合同、产品、规格、部位…" maxlength="200" @input="scheduleGallerySearch" @keyup.enter="loadGallery()"><button v-if="gallerySearch" aria-label="清除搜索" @click="clearGallerySearch">×</button></div>
           <div class="gallery-filter-shell">
             <div class="gallery-filters">
               <button class="filter-select" :class="{ selected: galleryProduct, open: galleryFilterOpen === 'product' }" @click="toggleGalleryFilter('product')"><span>产品</span>{{ galleryProduct || '全部产品' }} <i/></button>
@@ -836,19 +923,48 @@ onUnmounted(() => {
               <div class="calendar-actions"><button @click="clearDateFilter">清除</button><button class="primary" :disabled="!galleryFrom" @click="applyDateFilter">确定</button></div>
             </div>
           </div>
-          <div class="result-head"><b>{{ galleryPhotos.length }} 张照片</b><div class="gallery-actions"><button class="sort-button" :title="gallerySort === 'desc' ? '当前：最近拍摄在前' : '当前：最早拍摄在前'" @click="gallerySort = gallerySort === 'desc' ? 'asc' : 'desc'; loadGallery()">{{ gallerySort === 'desc' ? '↓' : '↑' }} 时间</button><button :class="{ active: galleryView === 'grid' }" title="卡片显示" @click="galleryView = 'grid'">▦</button><button :class="{ active: galleryView === 'list' }" title="记录显示" @click="galleryView = 'list'">☷</button></div></div>
+          <div class="result-head">
+            <div class="gallery-count"><b>共 {{ galleryTotal }} 张照片</b><small>第 {{ galleryPage }} / {{ Math.max(galleryTotalPages, 1) }} 页 · 每页 {{ galleryPageSize }} 张</small></div>
+            <div class="gallery-actions"><button class="sort-button" :title="gallerySort === 'desc' ? '当前：最近拍摄在前' : '当前：最早拍摄在前'" @click="gallerySort = gallerySort === 'desc' ? 'asc' : 'desc'; loadGallery()">{{ gallerySort === 'desc' ? '↓' : '↑' }} 时间</button><button :class="{ active: galleryView === 'grid' }" title="卡片显示" @click="galleryView = 'grid'">▦</button><button :class="{ active: galleryView === 'list' }" title="记录显示" @click="galleryView = 'list'">☷</button></div>
+          </div>
+          <div v-if="galleryPhotos.length && !galleryLoading" class="gallery-batch-bar">
+            <button @click="toggleGalleryPageSelection">{{ galleryPhotos.every(photo => selectedGalleryPhotoIds.has(photo.id)) ? '取消全选' : '全选本页' }}</button>
+            <span>已选 {{ selectedGalleryPhotoIds.size }} 张</span>
+            <button class="batch-download" :disabled="!selectedGalleryPhotoIds.size" @click="openDownload([...selectedGalleryPhotoIds])">批量下载</button>
+          </div>
           <p v-if="galleryError" class="camera-error">{{ galleryError }}</p><p v-else-if="galleryLoading" class="empty">正在加载图片…</p><p v-else-if="!galleryPhotos.length" class="empty">没有符合当前筛选条件的已上传图片</p>
-          <div v-else class="gallery" :class="{ grid: galleryView === 'grid' }"><button v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" @click="openGalleryPhoto(photo)"><img class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button></div>
+          <div v-else class="gallery" :class="{ grid: galleryView === 'grid' }">
+            <div v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" :class="{ 'is-selected': selectedGalleryPhotoIds.has(photo.id) }">
+              <label class="gallery-select" :class="{ checked: selectedGalleryPhotoIds.has(photo.id) }" @click.stop>
+                <input type="checkbox" :checked="selectedGalleryPhotoIds.has(photo.id)" :aria-label="`选择 ${photo.contract_no} 的照片`" @change="toggleGalleryPhoto(photo.id)">
+                <span aria-hidden="true">✓</span>
+              </label>
+              <button class="gallery-open" @click="openGalleryPhoto(photo)"><img class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button>
+            </div>
+          </div>
+          <nav v-if="galleryTotalPages > 1 && !galleryLoading" class="gallery-pagination" aria-label="照片分页">
+            <button :disabled="galleryPage === 1" @click="goToGalleryPage(galleryPage - 1)">‹ 上一页</button>
+            <button v-for="page in galleryPageNumbers" :key="page" :class="{ active: page === galleryPage }" :aria-current="page === galleryPage ? 'page' : undefined" @click="goToGalleryPage(page)">{{ page }}</button>
+            <button :disabled="galleryPage === galleryTotalPages" @click="goToGalleryPage(galleryPage + 1)">下一页 ›</button>
+          </nav>
         </section>
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
-          <header><button aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}</small></div><a :href="galleryPhotoUrl(selectedGalleryPhoto, 'download')" target="_blank" rel="noopener">下载</a></header>
+          <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}</small></div><div class="viewer-actions"><button class="rotate-button" aria-label="将照片顺时针旋转90度" @click="rotateGalleryPhoto"><span aria-hidden="true">↻</span> 旋转 90°</button><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></div></header>
           <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
-            <img class="viewer-preview" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
+            <img class="viewer-preview" :class="{ 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded, 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
             <span v-else-if="photoScale === 1" class="gesture-hint">双指捏合缩放 · 放大后单指拖动</span>
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
           </div>
         </div>
+        <DownloadOptionsDialog
+          v-if="downloadDialogOpen"
+          v-model:with-watermark="downloadWithWatermark"
+          :count="pendingDownloadIds.length"
+          :unavailable-count="unavailableGalleryOriginals"
+          @cancel="downloadDialogOpen = false"
+          @confirm="confirmDownload"
+        />
         <div v-if="h5CameraOpen" class="h5-camera" role="dialog" aria-modal="true" aria-label="拍照">
           <header class="h5-camera-header"><button :disabled="h5CameraPending > 0" aria-label="关闭相机" @click="closeH5Camera">×</button><div><b>{{ h5CameraTarget?.requirement }}</b><small>已保存 {{ h5CameraShotCount }} 张<span v-if="h5CameraPending"> · 正在保存 {{ h5CameraPending }} 张</span></small></div><span/></header>
           <div class="h5-camera-preview"><video ref="h5CameraVideo" :class="{ ready: h5CameraReady }" autoplay muted playsinline webkit-playsinline></video><p v-if="!h5CameraReady">正在启动相机…</p></div>
@@ -894,4 +1010,36 @@ onUnmounted(() => {
 .h5-camera-shutter{width:72px;height:72px;border:4px solid #fff;border-radius:50%;display:grid;place-items:center;justify-self:center}
 .h5-camera-shutter span{width:54px;height:54px;border-radius:50%;background:#fff}
 .h5-camera-shutter:active span{transform:scale(.88)}
+.gallery-count{display:flex;flex-direction:column;gap:3px}
+.gallery-count b{font-size:14px!important}
+.gallery-count small{color:#8a939f;font-size:10px;font-weight:400}
+.gallery-batch-bar{display:flex;align-items:center;gap:8px;margin:0 0 9px;padding:8px 9px;border:1px solid #e0e6ef;border-radius:9px;background:#fff}
+.gallery-batch-bar button{min-height:30px;padding:0 9px;border-radius:7px;background:#eef3fc;color:#2863db;font-size:11px}
+.gallery-batch-bar span{flex:1;color:#7d8794;font-size:11px;text-align:center}
+.gallery-batch-bar .batch-download{background:#3370ff;color:#fff;font-weight:600}
+.gallery-batch-bar .batch-download:disabled{background:#e8ebef;color:#9ca5b0}
+.gallery-item{position:relative}
+.gallery-open{display:flex;align-items:center;gap:10px;width:100%;padding:0;border:0;background:transparent;color:inherit;text-align:left}
+.gallery-item.is-selected{box-shadow:0 0 0 2px #3370ff5c,0 2px 8px #17233c08}
+.gallery-select{position:absolute;z-index:4;top:9px;left:9px;width:24px;height:24px;display:grid;place-items:center;border:1.5px solid #d2d9e3;border-radius:5px;background:#fff;color:transparent;box-shadow:0 2px 7px #17233c33;cursor:pointer}
+.gallery-select input{position:absolute;width:1px;height:1px;opacity:0}
+.gallery-select span{font-size:15px;font-weight:800;line-height:1}
+.gallery-select.checked{border-color:#3370ff;background:#3370ff;color:#fff}
+.gallery-select:focus-within{outline:3px solid #3370ff2b;outline-offset:2px}
+.gallery.grid .gallery-item{display:block;padding:6px}
+.gallery.grid .gallery-open{display:block}
+.gallery.grid .gallery-select{top:11px;left:11px}
+.gallery-pagination{display:flex;align-items:center;justify-content:center;gap:6px;margin:18px 0 4px}
+.gallery-pagination button{min-width:32px;height:32px;padding:0 8px;border:1px solid #dfe4eb;border-radius:7px;background:#fff;color:#5f6975;font-size:11px}
+.gallery-pagination button.active{border-color:#3370ff;background:#3370ff;color:#fff;font-weight:700}
+.gallery-pagination button:disabled{border-color:#edf0f3;background:#f4f6f8;color:#abb2bc}
+.photo-viewer header{grid-template-columns:40px minmax(0,1fr) auto}
+.photo-viewer header .viewer-back{font-size:34px}
+.photo-viewer .viewer-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;text-align:right}
+.photo-viewer .viewer-actions button{width:auto;padding:0 8px;border-radius:7px;color:#fff;font-size:11px;line-height:34px;font-weight:600;white-space:nowrap}
+.photo-viewer .viewer-actions .rotate-button{border:1px solid #72a1ff;background:#2459bd;font-size:12px}
+.photo-viewer .viewer-actions .rotate-button span{display:inline-block;margin-right:2px;font-size:17px;vertical-align:-1px}
+.photo-viewer .viewer-actions .viewer-download{background:#3370ff}
+.photo-stage img.quarter-turn{width:min(92vh,94vw);height:min(92vh,94vw);max-width:none;max-height:none;object-fit:contain}
+@media(max-width:390px){.photo-viewer header{grid-template-columns:34px minmax(0,1fr) auto;padding:8px 7px}.photo-viewer .viewer-actions .rotate-button{padding:0 6px;font-size:11px}.photo-viewer .viewer-actions .viewer-download{padding:0 6px}.gallery-pagination{gap:4px}.gallery-pagination button{padding:0 6px}}
 </style>

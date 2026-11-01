@@ -27,7 +27,7 @@ SUPPLEMENTAL_REQUIREMENT = "补充拍照"
 class PhotoCommitResult:
     photo_ids: list[str]
     sync_job_ids: list[int]
-    deleted_objects: list[tuple[str, str]]
+    deleted_objects: list[tuple[str, str, str | None]]
 
 
 def _dsn() -> str:
@@ -235,15 +235,16 @@ async def create_photo_record(values: dict[str, Any]) -> str:
             """INSERT INTO photo_records
                  (task_feishu_record_id, photographer_open_id, captured_at, contract_no, product_type,
                   inspection_item, source, factory_initials, sequence_no, specification, photographer_name,
-                  oss_object_key, preview_oss_object_key, original_filename, content_type, file_size_bytes,
+                  oss_object_key, original_oss_object_key, preview_oss_object_key, original_filename, content_type, file_size_bytes,
                   sha256, metadata, search_text)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20)
                RETURNING id""",
             values["task_id"], values["photographer_open_id"], values["captured_at"], values["contract_no"],
             values["product_type"], values["inspection_item"], values["source"], values["factory_initials"],
             values["sequence_no"], values["specification"], values["photographer_name"], values["oss_object_key"],
-            values["preview_oss_object_key"], values["original_filename"], values["content_type"], values["file_size_bytes"],
-            values["sha256"], json.dumps(values["metadata"], ensure_ascii=False), values["search_text"],
+            values["original_oss_object_key"], values["preview_oss_object_key"], values["original_filename"],
+            values["content_type"], values["file_size_bytes"], values["sha256"],
+            json.dumps(values["metadata"], ensure_ascii=False), values["search_text"],
         )
         return str(record["id"])
     finally:
@@ -270,7 +271,7 @@ async def commit_photo_records(
                 raise LookupError("Current user no longer exists")
             deleted_rows = await connection.fetch(
                 """SELECT id::text AS id, task_feishu_record_id, contract_no,
-                          oss_object_key, preview_oss_object_key
+                          oss_object_key, original_oss_object_key, preview_oss_object_key
                    FROM photo_records
                    WHERE id::text = ANY($1::text[]) AND photographer_open_id = $2
                    FOR UPDATE""",
@@ -308,19 +309,31 @@ async def commit_photo_records(
                     """INSERT INTO photo_records
                        (task_feishu_record_id, photographer_open_id, captured_at, contract_no, product_type,
                         inspection_item, source, factory_initials, sequence_no, specification, photographer_name,
-                        oss_object_key, preview_oss_object_key, original_filename, content_type, file_size_bytes,
-                        sha256, metadata, search_text)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb,$19)
+                        oss_object_key, original_oss_object_key, preview_oss_object_key, original_filename,
+                        content_type, file_size_bytes, sha256, metadata, search_text)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20)
                        RETURNING id""",
                     value["task_id"], user["open_id"], value["captured_at"], value["contract_no"],
                     task["product_type"] or "未分类", value["inspection_item"], value["source"], value["factory_initials"],
                     task["sequence_no"], task["specification"], user["name"], value["oss_object_key"],
-                    value["preview_oss_object_key"], value["original_filename"], value["content_type"], value["file_size_bytes"],
-                    value["sha256"], json.dumps(value["metadata"], ensure_ascii=False), value["search_text"],
+                    value["original_oss_object_key"], value["preview_oss_object_key"], value["original_filename"],
+                    value["content_type"], value["file_size_bytes"], value["sha256"],
+                    json.dumps(value["metadata"], ensure_ascii=False), value["search_text"],
                 )
                 ids.append(str(record["id"]))
             if mode == "save":
-                return PhotoCommitResult(ids, [], [(str(row["oss_object_key"]), str(row["preview_oss_object_key"])) for row in deleted_rows])
+                return PhotoCommitResult(
+                    ids,
+                    [],
+                    [
+                        (
+                            str(row["oss_object_key"]),
+                            str(row["preview_oss_object_key"]),
+                            str(row["original_oss_object_key"]) if row["original_oss_object_key"] else None,
+                        )
+                        for row in deleted_rows
+                    ],
+                )
             contract_numbers = sorted({str(task["contract_no"]) for task in tasks})
             contract_tasks = await connection.fetch(
                 """SELECT feishu_record_id, contract_no, product_type, inspection_status
@@ -377,7 +390,11 @@ async def commit_photo_records(
                 )
             )
             deleted_objects = [
-                (str(row["oss_object_key"]), str(row["preview_oss_object_key"]))
+                (
+                    str(row["oss_object_key"]),
+                    str(row["preview_oss_object_key"]),
+                    str(row["original_oss_object_key"]) if row["original_oss_object_key"] else None,
+                )
                 for row in deleted_rows
             ]
             return PhotoCommitResult(
@@ -409,38 +426,92 @@ async def commit_task_metadata(user_id: str, task_ids: list[str], contract_no: s
         await connection.close()
 
 
-async def photo_object_for_user(user_id: str, photo_id: str, preview: bool, scope: str = "mine") -> str:
+async def photo_object_for_user(
+    user_id: str,
+    photo_id: str,
+    preview: bool,
+    scope: str = "mine",
+    watermarked: bool = True,
+) -> str:
     if scope not in {"mine", "shared"}:
         raise ValueError("Invalid photo scope")
     connection = await asyncpg.connect(_dsn())
     try:
-        column = "preview_oss_object_key" if preview else "oss_object_key"
+        column = "preview_oss_object_key" if preview else ("oss_object_key" if watermarked else "original_oss_object_key")
         row = await connection.fetchrow(
             f"""SELECT p.{column} AS object_key FROM photo_records p
                 JOIN users u ON u.id = $1::uuid
                 WHERE p.id = $2::uuid AND ($3 = 'shared' OR p.photographer_open_id = u.open_id)""",
             user_id, photo_id, scope,
         )
-        if not row or not row["object_key"]:
+        if not row:
             raise LookupError("Photo not found")
+        if not row["object_key"]:
+            raise LookupError("Unwatermarked original not found")
         return str(row["object_key"])
     finally:
         await connection.close()
 
 
-async def delete_photo_for_inspector(user_id: str, photo_id: str) -> tuple[str, str]:
+async def photo_download_objects_for_user(
+    user_id: str,
+    photo_ids: list[str],
+    scope: str = "mine",
+    watermarked: bool = True,
+) -> list[dict[str, Any]]:
+    """Resolve selected photo assets while preserving the caller's selection order."""
+    if scope not in {"mine", "shared"}:
+        raise ValueError("Invalid photo scope")
+    if not photo_ids or len(photo_ids) > 50:
+        raise ValueError("Select between 1 and 50 photos")
+    unique_ids = list(dict.fromkeys(photo_ids))
+    column = "oss_object_key" if watermarked else "original_oss_object_key"
+    connection = await asyncpg.connect(_dsn())
+    try:
+        rows = await connection.fetch(
+            f"""SELECT p.id::text AS id, p.{column} AS object_key, p.original_filename,
+                       p.contract_no, p.inspection_item
+                FROM photo_records p JOIN users u ON u.id = $1::uuid
+                WHERE p.id::text = ANY($2::text[])
+                  AND ($3 = 'shared' OR p.photographer_open_id = u.open_id)""",
+            user_id, unique_ids, scope,
+        )
+        by_id = {str(row["id"]): row for row in rows}
+        if len(by_id) != len(unique_ids):
+            raise LookupError("One or more photos are unavailable")
+        if any(not by_id[photo_id]["object_key"] for photo_id in unique_ids):
+            raise LookupError("One or more photos have no unwatermarked original")
+        return [
+            {
+                "id": photo_id,
+                "object_key": str(by_id[photo_id]["object_key"]),
+                "original_filename": str(by_id[photo_id]["original_filename"] or ""),
+                "contract_no": str(by_id[photo_id]["contract_no"] or ""),
+                "inspection_item": str(by_id[photo_id]["inspection_item"] or ""),
+            }
+            for photo_id in unique_ids
+        ]
+    finally:
+        await connection.close()
+
+
+async def delete_photo_for_inspector(user_id: str, photo_id: str) -> tuple[str, str, str | None]:
     connection = await asyncpg.connect(_dsn())
     try:
         async with connection.transaction():
             row = await connection.fetchrow(
                 """DELETE FROM photo_records p USING users u
                    WHERE p.id = $2::uuid AND u.id = $1::uuid AND p.photographer_open_id = u.open_id
-                   RETURNING p.oss_object_key, p.preview_oss_object_key""",
+                   RETURNING p.oss_object_key, p.original_oss_object_key, p.preview_oss_object_key""",
                 user_id, photo_id,
             )
             if not row:
                 raise LookupError("Photo not found")
-            return str(row["oss_object_key"]), str(row["preview_oss_object_key"])
+            return (
+                str(row["oss_object_key"]),
+                str(row["preview_oss_object_key"]),
+                str(row["original_oss_object_key"]) if row["original_oss_object_key"] else None,
+            )
     finally:
         await connection.close()
 
@@ -455,8 +526,10 @@ async def inspector_photos(
     sort: str = "desc",
     scope: str = "mine",
     search: str | None = None,
-) -> list[dict[str, Any]]:
-    """Return visible uploaded photos with SQL-side metadata and token filters."""
+    page: int = 1,
+    page_size: int = 50,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return one page of visible photos and the total matching row count."""
     category_prefixes = {
         "material": ["材质光谱"],
         "surface": ["内外表面"],
@@ -471,6 +544,10 @@ async def inspector_photos(
         raise ValueError("Invalid sort direction")
     if scope not in {"mine", "shared"}:
         raise ValueError("Invalid photo scope")
+    if page < 1:
+        raise ValueError("Invalid photo page")
+    if page_size < 1 or page_size > 50:
+        raise ValueError("Photo page size must be between 1 and 50")
 
     captured_from_date = _filter_date(captured_from, "captured_from")
     captured_to_date = _filter_date(captured_to, "captured_to")
@@ -502,17 +579,26 @@ async def inspector_photos(
 
     connection = await asyncpg.connect(_dsn())
     try:
+        count_rows = await connection.fetch(
+            f"""SELECT COUNT(*)::int AS count
+                FROM photo_records p JOIN users u ON u.id = $1::uuid
+                WHERE {' AND '.join(clauses)}""",
+            *values,
+        )
+        total = int(count_rows[0]["count"]) if count_rows else 0
+        offset = (page - 1) * page_size
         rows = await connection.fetch(
             f"""SELECT p.id, p.original_filename, p.contract_no, p.product_type, p.specification,
                        p.inspection_item, p.captured_at, p.photographer_name,
+                       (p.original_oss_object_key IS NOT NULL) AS has_unwatermarked,
                        COALESCE(p.metadata->>'inspection_note', '') AS inspection_note
                 FROM photo_records p JOIN users u ON u.id = $1::uuid
                 WHERE {' AND '.join(clauses)}
                 ORDER BY p.captured_at {'ASC' if sort == 'asc' else 'DESC'}, p.id DESC
-                LIMIT 200""",
+                LIMIT {page_size} OFFSET {offset}""",
             *values,
         )
-        return [
+        photos = [
             {
                 "id": str(row["id"]),
                 "name": str(row["original_filename"] or "现场照片.jpg"),
@@ -523,9 +609,11 @@ async def inspector_photos(
                 "captured_at": row["captured_at"].isoformat(),
                 "photographer_name": str(row["photographer_name"] or ""),
                 "inspection_note": str(row["inspection_note"] or ""),
+                "has_unwatermarked": bool(row["has_unwatermarked"]),
             }
             for row in rows
         ]
+        return photos, total
     finally:
         await connection.close()
 

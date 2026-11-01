@@ -2,18 +2,22 @@ from datetime import datetime
 
 import pytest
 
+from app.api.feishu import _zip_filename
 from app.services import dashboard_repository
 
 
 class FakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
         self.query = ""
         self.values: tuple[object, ...] = ()
+        self.rows = rows or []
+        self.queries: list[str] = []
 
     async def fetch(self, query: str, *values: object) -> list[object]:
         self.query = query
         self.values = values
-        return []
+        self.queries.append(query)
+        return self.rows
 
     async def fetchrow(self, query: str, *values: object) -> dict[str, str]:
         self.query = query
@@ -72,6 +76,54 @@ async def test_gallery_rejects_invalid_or_reversed_date_ranges() -> None:
         await dashboard_repository.inspector_photos(
             "user-id", captured_from="2026-08-16", captured_to="2026-08-01",
         )
+
+
+@pytest.mark.asyncio
+async def test_gallery_returns_one_fifty_photo_page_with_total_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = FakeConnection()
+    monkeypatch.setattr(dashboard_repository.asyncpg, "connect", lambda _: _connection(connection))
+
+    photos, total = await dashboard_repository.inspector_photos("user-id", page=3, page_size=50)
+
+    assert photos == []
+    assert total == 0
+    assert "SELECT COUNT(*)::int AS count" in connection.queries[0]
+    assert "LIMIT 50 OFFSET 100" in connection.queries[1]
+
+
+@pytest.mark.asyncio
+async def test_gallery_rejects_page_sizes_above_fifty() -> None:
+    with pytest.raises(ValueError, match="between 1 and 50"):
+        await dashboard_repository.inspector_photos("user-id", page_size=51)
+
+
+@pytest.mark.asyncio
+async def test_batch_download_resolves_unwatermarked_originals_in_selection_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [
+        {"id": "photo-2", "object_key": "photos/2-original.jpg", "original_filename": "2.jpg", "contract_no": "C2", "inspection_item": "尺寸"},
+        {"id": "photo-1", "object_key": "photos/1-original.jpg", "original_filename": "1.jpg", "contract_no": "C1", "inspection_item": "材质光谱"},
+    ]
+    connection = FakeConnection(rows)
+    monkeypatch.setattr(dashboard_repository.asyncpg, "connect", lambda _: _connection(connection))
+
+    documents = await dashboard_repository.photo_download_objects_for_user(
+        "user-id", ["photo-2", "photo-1"], scope="shared", watermarked=False,
+    )
+
+    assert "p.original_oss_object_key" in connection.query
+    assert [document["id"] for document in documents] == ["photo-2", "photo-1"]
+    assert documents[0]["object_key"] == "photos/2-original.jpg"
+
+
+def test_batch_download_filename_cannot_escape_archive_directory() -> None:
+    filename = _zip_filename(
+        {"id": "../../photo-1", "contract_no": "C/1", "inspection_item": "尺寸"},
+        1,
+    )
+
+    assert "/" not in filename
+    assert not filename.startswith(".")
+    assert filename.endswith(".jpg")
 
 
 async def _connection(connection: FakeConnection) -> FakeConnection:

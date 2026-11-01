@@ -9,4 +9,11 @@ $env:PGPASSWORD = '<postgres password>'
 psql -h localhost -p 15432 -U qc_user -d smart_qc_capture_system -f database/init/001_schema.sql
 ```
 
+`001_schema.sql` 只用于空数据库首次初始化，不要在已有数据的库上重复执行。
+已有数据库升级时，请按文件名顺序执行尚未应用的迁移，例如本次水印原图功能：
+
+```powershell
+psql -h localhost -p 15432 -U qc_user -d smart_qc_capture_system -f database/migrations/007_photo_original_storage.sql
+```
+
 表：`users`、`orders`、`order_items`、`inspection_photo_tasks`、`photo_records`。其中拍照任务表是由商品检验规则生成的必拍清单；照片记录表保存 OSS 对象键、哈希、文件大小、状态和拍摄元数据，支持防漏拍、错拍及审计追溯。

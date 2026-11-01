@@ -6,7 +6,7 @@ import io
 import re
 from datetime import datetime
 
-from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 _FACTORY_SUFFIX = re.compile(r"^(?P<contract>.+?)-(?P<factory>[A-Za-z]+)$")
 _CONTRACT_PREFIX = re.compile(r"^(?P<year>\d{2})(?P<company>[A-Za-z]+)-(?P<employee>\d{2})(?P<code>[A-Za-z])(?P<order>\d+)$")
@@ -54,34 +54,92 @@ def format_specification(specification: str | None) -> str:
 def render_watermark(image_bytes: bytes, lines: tuple[str, str, str]) -> tuple[bytes, str]:
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
-            source = source.convert("RGB")
+            source = ImageOps.exif_transpose(source).convert("RGB")
             width, height = source.size
-            font_size = max(20, min(54, round(min(width, height) * 0.045)))
+            font_size = watermark_font_size(width, height)
             font = _font(font_size)
             spacing = max(5, font_size // 4)
-            padding = max(18, font_size // 2)
+            padding = max(18, font_size // 3)
             draw = ImageDraw.Draw(source)
-            box = draw.multiline_textbbox((0, 0), "\n".join(lines), font=font, spacing=spacing, stroke_width=1)
-            text_height = box[3] - box[1]
-            x, y = padding, max(padding, height - text_height - padding)
-            draw.multiline_text((x, y), "\n".join(lines), font=font, fill="white", spacing=spacing, stroke_width=max(1, font_size // 14), stroke_fill="black")
-            output = io.BytesIO()
-            source.save(output, format="JPEG", quality=92, optimize=True)
-            return output.getvalue(), "image/jpeg"
+            stroke_width = max(1, font_size // 14)
+            watermark_text = _wrap_watermark_lines(draw, lines, font, width - padding * 2, stroke_width)
+            box = draw.multiline_textbbox(
+                (0, 0), watermark_text, font=font, spacing=spacing, stroke_width=stroke_width,
+            )
+            x, y = padding - box[0], max(padding - box[1], height - box[3] - padding)
+            draw.multiline_text(
+                (x, y), watermark_text, font=font, fill="white", spacing=spacing,
+                stroke_width=stroke_width, stroke_fill="black",
+            )
+            return _jpeg_bytes(source, quality=92), "image/jpeg"
     except UnidentifiedImageError as exc:
         raise WatermarkError("Unsupported image data") from exc
+
+
+def render_unwatermarked(image_bytes: bytes) -> tuple[bytes, str]:
+    """Normalize an upload to the exact image that was captured, without overlays."""
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            source = ImageOps.exif_transpose(source).convert("RGB")
+            return _jpeg_bytes(source, quality=95), "image/jpeg"
+    except UnidentifiedImageError as exc:
+        raise WatermarkError("Unsupported image data") from exc
+
+
+def watermark_font_size(width: int, height: int) -> int:
+    """Use exactly three times the former font size so labels remain consistently legible."""
+    previous_size = max(20, min(54, round(min(width, height) * 0.045)))
+    return previous_size * 3
+
+
+def _wrap_watermark_lines(
+    draw: ImageDraw.ImageDraw,
+    lines: tuple[str, str, str],
+    font: ImageFont.FreeTypeFont,
+    max_width: int,
+    stroke_width: int,
+) -> str:
+    """Wrap oversized labels while retaining the enlarged three-times font size."""
+    wrapped: list[str] = []
+    for line in lines:
+        if draw.textlength(line, font=font) <= max_width:
+            wrapped.append(line)
+            continue
+        current = ""
+        for word in line.split():
+            candidate = f"{current} {word}".strip()
+            if draw.textlength(candidate, font=font) + stroke_width * 2 <= max_width:
+                current = candidate
+                continue
+            if current:
+                wrapped.append(current)
+                current = ""
+            for character in word:
+                candidate = current + character
+                if current and draw.textlength(candidate, font=font) + stroke_width * 2 > max_width:
+                    wrapped.append(current.rstrip())
+                    current = character
+                else:
+                    current = candidate
+        if current:
+            wrapped.append(current)
+    return "\n".join(wrapped)
 
 
 def render_thumbnail(image_bytes: bytes, max_size: int = 640) -> bytes:
     try:
         with Image.open(io.BytesIO(image_bytes)) as source:
-            source = source.convert("RGB")
+            source = ImageOps.exif_transpose(source).convert("RGB")
             source.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            output = io.BytesIO()
-            source.save(output, format="JPEG", quality=84, optimize=True)
-            return output.getvalue()
+            return _jpeg_bytes(source, quality=84)
     except UnidentifiedImageError as exc:
         raise WatermarkError("Unsupported image data") from exc
+
+
+def _jpeg_bytes(source: Image.Image, *, quality: int) -> bytes:
+    output = io.BytesIO()
+    source.save(output, format="JPEG", quality=quality, optimize=True)
+    return output.getvalue()
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont:

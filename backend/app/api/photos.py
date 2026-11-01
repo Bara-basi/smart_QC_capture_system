@@ -22,6 +22,7 @@ from app.services.watermark import (
     WatermarkError,
     factory_initials,
     render_thumbnail,
+    render_unwatermarked,
     render_watermark,
     watermark_lines,
 )
@@ -40,17 +41,26 @@ async def list_photos(
     sort: str = Query(default="desc", pattern="^(asc|desc)$"),
     scope: str = Query(default="mine", pattern="^(mine|shared)$"),
     q: str | None = Query(default=None, max_length=200),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=50, ge=1, le=50),
 ) -> dict[str, object]:
     user_id = request.session.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         from app.services.dashboard_repository import inspector_photos
-        photos = await inspector_photos(
+        photos, total = await inspector_photos(
             str(user_id), product_type=product_type, inspection_category=inspection_category,
             captured_from=captured_from, captured_to=captured_to, sort=sort, scope=scope, search=q,
+            page=page, page_size=page_size,
         )
-        return {"photos": photos, "count": len(photos)}
+        return {
+            "photos": photos,
+            "count": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": (total + page_size - 1) // page_size,
+        }
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
@@ -81,21 +91,23 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
         task = task_map[str(item["task_feishu_record_id"])]
         captured_at = datetime.now(UTC).astimezone()
         try:
+            unwatermarked, _ = await asyncio.to_thread(render_unwatermarked, image)
             watermarked, content_type = await asyncio.to_thread(
                 render_watermark, image, watermark_lines(task["contract_no"], task["sequence_no"], task["specification"], captured_at)
             )
             preview = await asyncio.to_thread(render_thumbnail, watermarked)
         except WatermarkError as exc:
             raise HTTPException(status_code=415, detail=str(exc)) from exc
-        object_key, preview_key = _object_keys(str(task["contract_no"]), str(item["task_feishu_record_id"]))
+        object_key, original_key, preview_key = _object_keys(str(task["contract_no"]), str(item["task_feishu_record_id"]))
         factory = factory_initials(str(task["contract_no"]))
         prepared.append({
             "task_id": str(item["task_feishu_record_id"]), "contract_no": str(payload["contract_no"]), "inspection_item": str(item["inspection_item"]),
             "captured_at": captured_at, "source": "feishu_h5_camera", "factory_initials": factory,
-            "oss_object_key": object_key, "preview_oss_object_key": preview_key, "original_filename": file.filename,
+            "oss_object_key": object_key, "original_oss_object_key": original_key,
+            "preview_oss_object_key": preview_key, "original_filename": file.filename,
             "content_type": content_type, "file_size_bytes": len(watermarked), "sha256": hashlib.sha256(watermarked).hexdigest(),
-            "watermarked": watermarked, "preview": preview,
-            "metadata": {"source": "feishu_h5_camera", "watermarked": True, "preview_bucket": settings.oss_preview_bucket, "client_captured_at": item["client_captured_at"], "inspection_note": item.get("inspection_note", "")},
+            "watermarked": watermarked, "unwatermarked": unwatermarked, "preview": preview,
+            "metadata": {"source": "feishu_h5_camera", "watermarked": True, "original_available": True, "preview_bucket": settings.oss_preview_bucket, "client_captured_at": item["client_captured_at"], "inspection_note": item.get("inspection_note", "")},
             "search_text": " ".join(str(value) for value in (task["contract_no"], factory or "", task["sequence_no"] or "", task["product_type"] or "", task["specification"] or "", item["inspection_item"], task["name"] or "") if value),
         })
 
@@ -103,9 +115,11 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
     try:
         for photo in prepared:
             uploaded.append((settings.oss_bucket, str(photo["oss_object_key"])))
+            uploaded.append((settings.oss_bucket, str(photo["original_oss_object_key"])))
             uploaded.append((settings.oss_preview_bucket, str(photo["preview_oss_object_key"])))
             await asyncio.gather(
                 asyncio.to_thread(upload_image, settings.oss_bucket, str(photo["oss_object_key"]), bytes(photo["watermarked"]), str(photo["content_type"])),
+                asyncio.to_thread(upload_image, settings.oss_bucket, str(photo["original_oss_object_key"]), bytes(photo["unwatermarked"]), str(photo["content_type"])),
                 asyncio.to_thread(upload_image, settings.oss_preview_bucket, str(photo["preview_oss_object_key"]), bytes(photo["preview"]), str(photo["content_type"])),
             )
         commit_result = await commit_photo_records(
@@ -135,11 +149,11 @@ async def commit_photos(request: Request, manifest: str = Form(...), files: list
     await _cleanup_uploaded(
         [
             pair
-            for original_key, preview_key in commit_result.deleted_objects
-            for pair in (
-                (settings.oss_bucket, original_key),
+            for watermarked_key, preview_key, original_key in commit_result.deleted_objects
+            for pair in [
+                (settings.oss_bucket, watermarked_key),
                 (settings.oss_preview_bucket, preview_key),
-            )
+            ] + ([(settings.oss_bucket, original_key)] if original_key else [])
         ]
     )
     return {
@@ -165,9 +179,11 @@ async def delete_photo(photo_id: str, request: Request) -> dict[str, bool]:
         raise HTTPException(status_code=401, detail="Not authenticated")
     from app.services.dashboard_repository import delete_photo_for_inspector
     try:
-        original_key, preview_key = await delete_photo_for_inspector(str(user_id), photo_id)
-        delete_image(settings.oss_bucket, original_key)
+        watermarked_key, preview_key, original_key = await delete_photo_for_inspector(str(user_id), photo_id)
+        delete_image(settings.oss_bucket, watermarked_key)
         delete_image(settings.oss_preview_bucket, preview_key)
+        if original_key:
+            delete_image(settings.oss_bucket, original_key)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail="Photo not found") from exc
     except OssError as exc:
@@ -216,10 +232,10 @@ def _manifest(value: str, file_count: int) -> dict[str, object]:
     return payload
 
 
-def _object_keys(contract_no: str, task_id: str) -> tuple[str, str]:
+def _object_keys(contract_no: str, task_id: str) -> tuple[str, str, str]:
     safe_contract = "".join(char if char.isalnum() else "-" for char in contract_no).strip("-") or "unknown-contract"
     base = "/".join(part for part in (settings.oss_prefix.strip("/"), safe_contract, task_id, uuid4().hex) if part)
-    return f"{base}.jpg", f"{base}-preview.jpg"
+    return f"{base}.jpg", f"{base}-original.jpg", f"{base}-preview.jpg"
 
 
 def _is_supported_image(image: bytes) -> bool:

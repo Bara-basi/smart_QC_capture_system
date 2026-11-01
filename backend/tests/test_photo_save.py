@@ -53,7 +53,7 @@ def task():
 async def test_save_persists_photo_without_status_updates(database):
     connection, enqueue = database
     connection.fetch.return_value = [task()]
-    photo = dict.fromkeys(["captured_at", "source", "factory_initials", "oss_object_key", "preview_oss_object_key", "original_filename", "content_type", "file_size_bytes", "sha256", "search_text"], "test")
+    photo = dict.fromkeys(["captured_at", "source", "factory_initials", "oss_object_key", "original_oss_object_key", "preview_oss_object_key", "original_filename", "content_type", "file_size_bytes", "sha256", "search_text"], "test")
     photo.update(task_id="t1", contract_no="C1", inspection_item="材质光谱", metadata={})
     result = await repository.commit_photo_records("u1", [photo], contract_no="C1", mode="save", submitted_task_ids=["t1"])
     assert result.photo_ids == ["p1"]
