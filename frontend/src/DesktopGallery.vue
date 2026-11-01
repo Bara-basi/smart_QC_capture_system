@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
+import { rangeIdsInclusive } from './selection'
 
 type GalleryPhoto = { id: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string; has_unwatermarked: boolean }
 type GalleryResponse = { photos: GalleryPhoto[]; count: number; page: number; page_size: number; total_pages: number }
@@ -28,6 +29,8 @@ const totalPages = ref(0)
 const pageSize = 50
 const loading = ref(true)
 const error = ref('')
+const downloadBusy = ref(false)
+const downloadError = ref('')
 const selected = ref<GalleryPhoto | null>(null)
 const fullLoaded = ref(false)
 const rotation = ref(0)
@@ -37,13 +40,20 @@ const downloadWithWatermark = ref(true)
 const pendingDownloadIds = ref<string[]>([])
 const currentUser = ref<CurrentUser | null>(null)
 let searchTimer = 0
+let swipeStart: { x: number; y: number } | null = null
+let selectionAnchorId: string | null = null
+const DOWNLOAD_TIMEOUT_MS = 300_000
 
 const partLabel = computed(() => partOptions.find(item => item.value === part.value)?.label || '全部部位')
 const activeFilterCount = computed(() => Number(Boolean(product.value)) + Number(Boolean(part.value)) + Number(Boolean(from.value || to.value)))
 const dateSummary = computed(() => from.value || to.value ? `${from.value || '最早'} 至 ${to.value || '今天'}` : '全部时间')
 const profileInitial = computed(() => currentUser.value?.name?.trim().slice(0, 1) || '用')
+const selectedIndex = computed(() => selected.value ? photos.value.findIndex(photo => photo.id === selected.value?.id) : -1)
+const hasPrevious = computed(() => selectedIndex.value > 0)
+const hasNext = computed(() => selectedIndex.value >= 0 && selectedIndex.value < photos.value.length - 1)
 const selectedPhotos = computed(() => photos.value.filter(photo => selectedPhotoIds.value.has(photo.id)))
 const unavailableOriginalCount = computed(() => selectedPhotos.value.filter(photo => !photo.has_unwatermarked).length)
+const allSelected = computed(() => photos.value.length > 0 && selectedPhotos.value.length === photos.value.length)
 const pageNumbers = computed(() => {
   const count = Math.min(5, totalPages.value)
   const start = Math.max(1, Math.min(currentPage.value - 2, totalPages.value - count + 1))
@@ -54,6 +64,7 @@ const rotationTransform = computed(() => `rotate(${rotation.value}deg)`)
 async function loadPhotos(resetPage = true) {
   loading.value = true
   error.value = ''
+  downloadError.value = ''
   try {
     if (resetPage) currentPage.value = 1
     const query = new URLSearchParams({
@@ -114,13 +125,16 @@ function datePreset(days: number | 'month') {
 }
 function photoUrl(photo: GalleryPhoto, kind: 'preview' | 'full' | 'download') { return `/api/v1/feishu/photos/${photo.id}/${kind}?scope=${scope.value}` }
 function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? '未知时间' : date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) }
-function openPhoto(photo: GalleryPhoto) { selected.value = photo; fullLoaded.value = false; rotation.value = 0 }
+function openPhoto(photo: GalleryPhoto) { selected.value = photo; fullLoaded.value = false; rotation.value = 0; downloadError.value = '' }
 function rotatePhoto() { rotation.value = (rotation.value + 90) % 360 }
-function togglePhoto(photoId: string) {
+function togglePhoto(photoId: string, extendRange = false) {
   const next = new Set(selectedPhotoIds.value)
-  if (next.has(photoId)) next.delete(photoId)
+  if (extendRange && selectionAnchorId) {
+    rangeIdsInclusive(photos.value.map(photo => photo.id), selectionAnchorId, photoId).forEach(id => next.add(id))
+  } else if (next.has(photoId)) next.delete(photoId)
   else next.add(photoId)
   selectedPhotoIds.value = next
+  selectionAnchorId = photoId
 }
 function toggleCurrentPage() {
   const next = new Set(selectedPhotoIds.value)
@@ -130,6 +144,7 @@ function toggleCurrentPage() {
     else next.add(photo.id)
   }
   selectedPhotoIds.value = next
+  selectionAnchorId = allSelected ? null : photos.value[0]?.id || null
 }
 function goToPage(page: number) {
   if (page < 1 || page > totalPages.value || page === currentPage.value) return
@@ -138,35 +153,103 @@ function goToPage(page: number) {
   loadPhotos(false)
   document.querySelector('.results')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
+function navigatePhoto(offset: number) {
+  const target = photos.value[selectedIndex.value + offset]
+  if (!target) return
+  selected.value = target
+  fullLoaded.value = false
+  rotation.value = 0
+  downloadError.value = ''
+}
+function startSwipe(event: PointerEvent) { swipeStart = { x: event.clientX, y: event.clientY } }
+function cancelSwipe() { swipeStart = null }
+function endSwipe(event: PointerEvent) {
+  if (!swipeStart) return
+  const dx = event.clientX - swipeStart.x
+  const dy = event.clientY - swipeStart.y
+  swipeStart = null
+  if (Math.abs(dx) >= 60 && Math.abs(dx) > Math.abs(dy) * 1.25) navigatePhoto(dx < 0 ? 1 : -1)
+}
+function saveBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+function responseFilename(response: Response, fallback: string) {
+  const match = (response.headers.get('content-disposition') || '').match(/filename="([^"]+)"/i)
+  return match?.[1] || fallback
+}
+async function fetchDownload(input: RequestInfo | URL, init: RequestInit = {}) {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS)
+  try {
+    return await fetch(input, { ...init, signal: controller.signal })
+  } catch (cause) {
+    if (controller.signal.aborted) throw new Error('下载超时，请缩小范围后重试')
+    throw cause
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
 function openDownload(ids: string[]) {
   if (!ids.length) return
   pendingDownloadIds.value = ids
   downloadWithWatermark.value = true
   downloadDialogOpen.value = true
 }
-function confirmDownload() {
+async function confirmDownload() {
   const ids = pendingDownloadIds.value
   if (!ids.length) return
-  if (ids.length === 1) {
-    const query = new URLSearchParams({ scope: scope.value, watermarked: String(downloadWithWatermark.value) })
-    const link = document.createElement('a')
-    link.href = `/api/v1/feishu/photos/${ids[0]}/download?${query}`
-    link.download = ''
-    link.click()
-  } else {
-    const query = new URLSearchParams({ scope: scope.value, watermarked: String(downloadWithWatermark.value) })
-    for (const id of ids) query.append('photo_ids', id)
-    window.location.assign(`/api/v1/feishu/photos/download-batch?${query}`)
-  }
-  selectedPhotoIds.value = new Set()
   downloadDialogOpen.value = false
+  downloadBusy.value = true
+  downloadError.value = ''
+  try {
+    let response: Response
+    let fallbackName: string
+    if (ids.length === 1) {
+      const query = new URLSearchParams({ scope: scope.value, watermarked: String(downloadWithWatermark.value) })
+      response = await fetchDownload(`/api/v1/feishu/photos/${ids[0]}/download?${query}`, { credentials: 'include' })
+      fallbackName = `qc-photo-${ids[0]}.jpg`
+    } else {
+      response = await fetchDownload('/api/v1/feishu/photos/download-batch', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: scope.value, photo_ids: ids, watermarked: downloadWithWatermark.value }),
+      })
+      const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
+      fallbackName = `qc-photos-${timestamp}.zip`
+    }
+    if (response.status === 401) throw new Error('登录已过期，请刷新页面重新登录后再下载')
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '图片下载失败')
+    saveBlob(await response.blob(), responseFilename(response, fallbackName))
+    selectedPhotoIds.value = new Set()
+  } catch (cause) {
+    downloadError.value = cause instanceof Error ? cause.message : '图片下载失败，请稍后重试'
+  } finally {
+    downloadBusy.value = false
+  }
 }
 function onKeydown(event: KeyboardEvent) {
-  if (event.key !== 'Escape') return
-  if (downloadDialogOpen.value) downloadDialogOpen.value = false
-  else selected.value = null
+  if (event.key === 'Escape') {
+    if (downloadDialogOpen.value) downloadDialogOpen.value = false
+    else selected.value = null
+    return
+  }
+  if (!selected.value) return
+  if (event.key === 'ArrowLeft') { event.preventDefault(); navigatePhoto(-1) }
+  else if (event.key === 'ArrowRight') { event.preventDefault(); navigatePhoto(1) }
 }
 onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser(); loadPhotos() })
+onUnmounted(() => {
+  window.removeEventListener('keydown', onKeydown)
+})
 </script>
 
 <template>
@@ -212,6 +295,7 @@ onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser
               <button :title="sort === 'desc' ? '当前按最新拍摄时间排序' : '当前按最早拍摄时间排序'" @click="sort = sort === 'desc' ? 'asc' : 'desc'; loadPhotos()">{{ sort === 'desc' ? '↓ 最新优先' : '↑ 最早优先' }}</button><span class="divider"/><button :class="{ selected: view === 'grid' }" title="宫格视图" @click="view = 'grid'">▦</button><button :class="{ selected: view === 'list' }" title="列表视图" @click="view = 'list'">☷</button>
             </div>
           </header>
+          <p v-if="downloadError" class="state error">{{ downloadError }}</p>
           <p v-if="error" class="state error">{{ error }}</p>
           <p v-else-if="loading" class="state">正在载入照片…</p>
           <div v-else-if="photos.length" class="photo-grid" :class="view">
@@ -237,9 +321,10 @@ onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser
     </section>
 
     <div v-if="selected" class="viewer" role="dialog" aria-modal="true" :aria-label="`${selected.contract_no} 照片预览`" @click.self="selected = null">
-      <header><div><p>{{ selected.contract_no }}</p><b>{{ selected.product_type }}<template v-if="selected.specification"> · {{ selected.specification }}</template> · {{ selected.inspection_item }}</b></div><div class="viewer-actions"><button class="rotate-button" aria-label="将照片顺时针旋转90度" @click="rotatePhoto"><span aria-hidden="true">↻</span> 旋转 90°</button><button class="download-button" @click="openDownload([selected.id])">⇩ 下载</button><button class="close-button" aria-label="关闭预览" @click="selected = null">×</button></div></header>
-      <div class="viewer-stage"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span></div>
-      <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="selected.inspection_note"> · 备注：{{ selected.inspection_note }}</template><template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>按 Esc 关闭</span></footer>
+      <header><div><p>{{ selected.contract_no }} <template v-if="selectedIndex >= 0">· {{ selectedIndex + 1 }} / {{ photos.length }}</template></p><b>{{ selected.product_type }}<template v-if="selected.specification"> · {{ selected.specification }}</template> · {{ selected.inspection_item }}</b></div><div class="viewer-actions"><button class="rotate-button" aria-label="将照片顺时针旋转90度" @click="rotatePhoto"><span aria-hidden="true">↻</span> 旋转 90°</button><button class="download-button" @click="openDownload([selected.id])">⇩ 下载</button><button class="close-button" aria-label="关闭预览" @click="selected = null">×</button></div></header>
+      <p v-if="downloadError" class="viewer-error">{{ downloadError }}</p>
+      <div class="viewer-stage" @pointerdown="startSwipe" @pointerup="endSwipe" @pointercancel="cancelSwipe"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span><button class="viewer-nav previous" :disabled="!hasPrevious" aria-label="上一张照片" @pointerdown.stop @click="navigatePhoto(-1)">‹</button><button class="viewer-nav next" :disabled="!hasNext" aria-label="下一张照片" @pointerdown.stop @click="navigatePhoto(1)">›</button></div>
+      <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="selected.inspection_note"> · 备注：{{ selected.inspection_note }}</template><template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>← → 切换图片 · Esc 关闭</span></footer>
     </div>
     <DownloadOptionsDialog
       v-if="downloadDialogOpen"
@@ -286,5 +371,10 @@ onMounted(() => { window.addEventListener('keydown', onKeydown); loadCurrentUser
 .viewer header .viewer-actions button:focus-visible{outline:2px solid #fff;outline-offset:2px}
 .viewer-stage img{transition:opacity .2s ease,transform .2s ease;transform-origin:center}
 .viewer-stage img.quarter-turn{width:min(92vh,94vw);height:min(92vh,94vw);max-width:none;max-height:none;object-fit:contain}
+.viewer .viewer-error{margin:0;padding:8px 28px;background:#9b2b2b;color:#fff;font-size:12px}
+.viewer-stage .viewer-nav{position:absolute;z-index:4;top:50%;width:44px;height:68px;padding:0;transform:translateY(-50%);border-radius:10px;background:#141b24cc;color:#fff;font-size:42px;line-height:1;display:grid;place-items:center;backdrop-filter:blur(4px)}
+.viewer-stage .viewer-nav.previous{left:18px}
+.viewer-stage .viewer-nav.next{right:18px}
+.viewer-stage .viewer-nav:disabled{opacity:.2;pointer-events:none}
 @media(max-width:780px){.result-tools .selection-button,.result-tools .download-selected{padding:0 8px}.viewer header{padding:0 13px}.viewer header .viewer-actions{gap:5px!important}.viewer header .viewer-actions button{padding:0 8px}.viewer header b{max-width:40vw}}
 </style>

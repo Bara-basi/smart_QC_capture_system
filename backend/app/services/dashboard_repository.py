@@ -10,6 +10,7 @@ from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import asyncpg
@@ -453,44 +454,45 @@ async def photo_object_for_user(
         await connection.close()
 
 
-async def photo_download_objects_for_user(
+async def photo_downloads_for_user(
     user_id: str,
     photo_ids: list[str],
     scope: str = "mine",
     watermarked: bool = True,
-) -> list[dict[str, Any]]:
-    """Resolve selected photo assets while preserving the caller's selection order."""
+) -> list[asyncpg.Record]:
+    """Return authorized downloadable assets in caller order."""
     if scope not in {"mine", "shared"}:
         raise ValueError("Invalid photo scope")
-    if not photo_ids or len(photo_ids) > 50:
-        raise ValueError("Select between 1 and 50 photos")
-    unique_ids = list(dict.fromkeys(photo_ids))
-    column = "oss_object_key" if watermarked else "original_oss_object_key"
+    if not photo_ids:
+        raise ValueError("Select at least one photo")
+    if len(photo_ids) > 200:
+        raise ValueError("At most 200 photos can be downloaded at once")
+    try:
+        ordered_ids = list(dict.fromkeys(str(UUID(photo_id)) for photo_id in photo_ids))
+    except ValueError as exc:
+        raise ValueError("Invalid photo ID") from exc
+
     connection = await asyncpg.connect(_dsn())
     try:
+        column = "oss_object_key" if watermarked else "original_oss_object_key"
         rows = await connection.fetch(
-            f"""SELECT p.id::text AS id, p.{column} AS object_key, p.original_filename,
-                       p.contract_no, p.inspection_item
-                FROM photo_records p JOIN users u ON u.id = $1::uuid
-                WHERE p.id::text = ANY($2::text[])
-                  AND ($3 = 'shared' OR p.photographer_open_id = u.open_id)""",
-            user_id, unique_ids, scope,
+            f"""SELECT p.id::text AS id, p.{column} AS object_key, p.contract_no, p.product_type,
+                      p.specification, p.inspection_item, p.captured_at,
+                      p.content_type, p.file_size_bytes
+               FROM photo_records p
+               JOIN users u ON u.id = $1::uuid
+               WHERE p.id = ANY($2::uuid[])
+                 AND ($3 = 'shared' OR p.photographer_open_id = u.open_id)""",
+            user_id,
+            ordered_ids,
+            scope,
         )
-        by_id = {str(row["id"]): row for row in rows}
-        if len(by_id) != len(unique_ids):
+        rows_by_id = {str(row["id"]): row for row in rows}
+        if len(rows_by_id) != len(ordered_ids):
             raise LookupError("One or more photos are unavailable")
-        if any(not by_id[photo_id]["object_key"] for photo_id in unique_ids):
+        if any(not rows_by_id[photo_id]["object_key"] for photo_id in ordered_ids):
             raise LookupError("One or more photos have no unwatermarked original")
-        return [
-            {
-                "id": photo_id,
-                "object_key": str(by_id[photo_id]["object_key"]),
-                "original_filename": str(by_id[photo_id]["original_filename"] or ""),
-                "contract_no": str(by_id[photo_id]["contract_no"] or ""),
-                "inspection_item": str(by_id[photo_id]["inspection_item"] or ""),
-            }
-            for photo_id in unique_ids
-        ]
+        return [rows_by_id[photo_id] for photo_id in ordered_ids]
     finally:
         await connection.close()
 

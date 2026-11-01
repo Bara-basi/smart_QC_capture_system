@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import DesktopGallery from './DesktopGallery.vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
+import { rangeIdsInclusive } from './selection'
 
 type Order = { contract_no: string; started_at: string; task_count: number; pending_count: number; status: string; products: string[]; task_ids: string[] }
 type Requirement = { name: string; mandatory: boolean }
@@ -14,12 +15,21 @@ type Photo = { name: string; tone: string; url: string; draftId?: string; record
 type GalleryPhoto = { id: string; name: string; contract_no: string; product_type: string; specification: string; inspection_item: string; inspection_note: string; captured_at: string; photographer_name: string; has_unwatermarked: boolean }
 type GalleryResponse = { photos: GalleryPhoto[]; count: number; page: number; page_size: number; total_pages: number }
 type FeishuChooseImageResult = { tempFilePaths?: string[]; localIds?: string[] }
-type FileSystemManager = { readFile: (options: { filePath: string; encoding?: 'base64'; success: (result: { data: string | ArrayBuffer }) => void; fail: (error: unknown) => void }) => void }
+type FeishuDownloadResult = { tempFilePath: string; statusCode?: number }
+type FeishuCallbackOptions = { success?: (result: unknown) => void; fail?: (error: unknown) => void }
+type FileSystemManager = {
+  readFile: (options: { filePath: string; encoding?: 'base64'; success: (result: { data: string | ArrayBuffer }) => void; fail: (error: unknown) => void }) => void
+}
 
 declare global {
   interface Window {
     h5sdk?: { config: (options: Record<string, unknown>) => void; ready: (callback: () => void) => void; error?: (callback: (error: unknown) => void) => void }
-    tt?: { chooseImage: (options: { count: number; sourceType: string[]; sizeType?: string[]; success: (result: FeishuChooseImageResult) => void; fail: (error: unknown) => void }) => void; getFileSystemManager?: () => FileSystemManager }
+    tt?: {
+      chooseImage: (options: { count: number; sourceType: string[]; sizeType?: string[]; success: (result: FeishuChooseImageResult) => void; fail: (error: unknown) => void }) => void
+      getFileSystemManager?: () => FileSystemManager
+      downloadFile?: (options: { url: string; success: (result: FeishuDownloadResult) => void; fail: (error: unknown) => void }) => void
+      saveImageToPhotosAlbum?: (options: { filePath: string } & FeishuCallbackOptions) => void
+    }
   }
 }
 
@@ -69,6 +79,10 @@ const galleryScope = ref<'mine' | 'shared'>('mine')
 const gallerySearch = ref('')
 const gallerySort = ref<'asc' | 'desc'>('desc')
 const galleryView = ref<'list' | 'grid'>('list')
+const galleryDownloading = ref(false)
+const galleryDownloadError = ref('')
+const downloadToast = ref('')
+const gallerySelecting = ref(false)
 const galleryFilterOpen = ref<'product' | 'part' | 'date' | null>(null)
 const selectedGalleryPhoto = ref<GalleryPhoto | null>(null)
 const fullPhotoLoaded = ref(false)
@@ -81,6 +95,8 @@ const viewerImage = ref<HTMLImageElement | null>(null)
 const activePhotoPointers = new Map<number, { x: number; y: number }>()
 let panOrigin = { x: 0, y: 0, offsetX: 0, offsetY: 0 }
 let pinchOrigin = { distance: 0, scale: 1, contentX: 0, contentY: 0 }
+let swipeOrigin = { x: 0, y: 0 }
+let gestureHadPinch = false
 const calendarCursor = ref(new Date(new Date().getFullYear(), new Date().getMonth(), 1))
 const productOptions = ['管件', '法兰', '管子', '焊管', '无缝管', '板材', '棒材', '盘管', '其它']
 const partOptions = [
@@ -89,9 +105,16 @@ const partOptions = [
   { value: 'port', label: '端口坡口' }, { value: 'weld', label: '焊道' },
 ]
 let gallerySearchTimer = 0
+let gallerySelectionAnchorId: string | null = null
+let galleryLongPressTimer = 0
+let galleryLongPressOrigin = { x: 0, y: 0 }
+let gallerySuppressClick = false
+let gallerySuppressClickTimer = 0
+let downloadToastTimer = 0
 let jsapiReady: Promise<void> | null = null
 const DEFAULT_REQUEST_TIMEOUT_MS = 20_000
 const UPLOAD_REQUEST_TIMEOUT_MS = 180_000
+const DOWNLOAD_REQUEST_TIMEOUT_MS = 300_000
 const MAX_UPLOAD_DIMENSION = 1920
 const SUPPLEMENTAL_REQUIREMENT = '补充拍照'
 const LAST_ORDER_STORAGE_KEY = 'qc:last-opened-order'
@@ -128,6 +151,13 @@ const galleryPageNumbers = computed(() => {
 })
 const selectedGalleryPhotos = computed(() => galleryPhotos.value.filter(photo => selectedGalleryPhotoIds.value.has(photo.id)))
 const unavailableGalleryOriginals = computed(() => selectedGalleryPhotos.value.filter(photo => !photo.has_unwatermarked).length)
+const selectedGalleryIndex = computed(() => {
+  if (!selectedGalleryPhoto.value) return -1
+  return galleryPhotos.value.findIndex(photo => photo.id === selectedGalleryPhoto.value?.id)
+})
+const hasPreviousGalleryPhoto = computed(() => selectedGalleryIndex.value > 0)
+const hasNextGalleryPhoto = computed(() => selectedGalleryIndex.value >= 0 && selectedGalleryIndex.value < galleryPhotos.value.length - 1)
+const allGalleryPhotosSelected = computed(() => galleryPhotos.value.length > 0 && selectedGalleryPhotos.value.length === galleryPhotos.value.length)
 const sortedOrders = computed(() => {
   // Default order list is sorted newest-first within each group; completed
   // orders stay at the end so pending work is always reachable first.
@@ -186,6 +216,7 @@ function galleryDate(value: string) {
 async function loadGallery(resetPage = true) {
   galleryLoading.value = true
   galleryError.value = ''
+  galleryDownloadError.value = ''
   try {
     if (resetPage) galleryPage.value = 1
     const query = new URLSearchParams({
@@ -300,10 +331,250 @@ function galleryPhotoUrl(photo: GalleryPhoto, kind: 'preview' | 'full' | 'downlo
   return `/api/v1/feishu/photos/${photo.id}/${kind}?scope=${galleryScope.value}`
 }
 
+function enterGallerySelection(photoId?: string) {
+  gallerySelecting.value = true
+  if (!photoId) {
+    gallerySelectionAnchorId = null
+    return
+  }
+  selectedGalleryPhotoIds.value = new Set([...selectedGalleryPhotoIds.value, photoId])
+  gallerySelectionAnchorId = photoId
+}
+
+function exitGallerySelection() {
+  window.clearTimeout(galleryLongPressTimer)
+  window.clearTimeout(gallerySuppressClickTimer)
+  gallerySelecting.value = false
+  galleryDownloadError.value = ''
+  selectedGalleryPhotoIds.value = new Set()
+  gallerySelectionAnchorId = null
+  gallerySuppressClick = false
+}
+
+function toggleGallerySelection(photoId: string, extendRange = false) {
+  if (!gallerySelecting.value) gallerySelecting.value = true
+  const next = new Set(selectedGalleryPhotoIds.value)
+  if (extendRange && gallerySelectionAnchorId) {
+    rangeIdsInclusive(galleryPhotos.value.map(photo => photo.id), gallerySelectionAnchorId, photoId)
+      .forEach(id => next.add(id))
+  } else if (next.has(photoId)) {
+    next.delete(photoId)
+  } else {
+    next.add(photoId)
+  }
+  selectedGalleryPhotoIds.value = next
+  gallerySelectionAnchorId = photoId
+}
+
+function toggleAllGalleryPhotos() {
+  const selectAll = !allGalleryPhotosSelected.value
+  selectedGalleryPhotoIds.value = selectAll
+    ? new Set(galleryPhotos.value.map(photo => photo.id))
+    : new Set()
+  gallerySelectionAnchorId = selectAll ? galleryPhotos.value[0]?.id || null : null
+}
+
+function handleGalleryPhotoClick(event: MouseEvent, photo: GalleryPhoto) {
+  if (gallerySuppressClick) {
+    window.clearTimeout(gallerySuppressClickTimer)
+    gallerySuppressClick = false
+    return
+  }
+  if (event.shiftKey && !gallerySelecting.value) {
+    enterGallerySelection(photo.id)
+    return
+  }
+  if (gallerySelecting.value) {
+    toggleGallerySelection(photo.id, event.shiftKey)
+  } else {
+    openGalleryPhoto(photo)
+  }
+}
+
+function startGalleryLongPress(event: PointerEvent, photo: GalleryPhoto) {
+  if (gallerySelecting.value || event.pointerType === 'mouse') return
+  galleryLongPressOrigin = { x: event.clientX, y: event.clientY }
+  window.clearTimeout(galleryLongPressTimer)
+  galleryLongPressTimer = window.setTimeout(() => {
+    gallerySuppressClick = true
+    window.clearTimeout(gallerySuppressClickTimer)
+    gallerySuppressClickTimer = window.setTimeout(() => { gallerySuppressClick = false }, 800)
+    navigator.vibrate?.(15)
+    enterGallerySelection(photo.id)
+  }, 520)
+}
+
+function moveGalleryLongPress(event: PointerEvent) {
+  if (Math.hypot(event.clientX - galleryLongPressOrigin.x, event.clientY - galleryLongPressOrigin.y) > 12) {
+    window.clearTimeout(galleryLongPressTimer)
+  }
+}
+
+function cancelGalleryLongPress() {
+  window.clearTimeout(galleryLongPressTimer)
+}
+
+function navigateGalleryPhoto(offset: number) {
+  const index = selectedGalleryIndex.value
+  if (index < 0) return
+  const target = galleryPhotos.value[index + offset]
+  if (!target) return
+  selectedGalleryPhoto.value = target
+  fullPhotoLoaded.value = false
+  galleryDownloadError.value = ''
+  resetPhotoZoom()
+}
+
+function handleGalleryViewerKeydown(event: KeyboardEvent) {
+  if (!selectedGalleryPhoto.value) return
+  if (event.key === 'ArrowLeft') {
+    event.preventDefault()
+    navigateGalleryPhoto(-1)
+  } else if (event.key === 'ArrowRight') {
+    event.preventDefault()
+    navigateGalleryPhoto(1)
+  } else if (event.key === 'Escape') {
+    event.preventDefault()
+    closeGalleryPhoto()
+  }
+}
+
+function downloadFileName(response: Response, fallback: string) {
+  const disposition = response.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename="([^"]+)"/i)
+  return match?.[1] || fallback
+}
+
+function showDownloadToast(message: string) {
+  downloadToast.value = message
+  window.clearTimeout(downloadToastTimer)
+  downloadToastTimer = window.setTimeout(() => { downloadToast.value = '' }, 3600)
+}
+
+function saveDownloadedBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  window.setTimeout(() => URL.revokeObjectURL(url), 30_000)
+}
+
+function canSaveToPhoneAlbum() {
+  return Boolean(window.tt?.downloadFile && window.tt?.saveImageToPhotosAlbum)
+}
+
+async function savePhotoToPhoneAlbum(photo: GalleryPhoto, withWatermark = true) {
+  if (!canSaveToPhoneAlbum()) return false
+  const response = await fetchWithTimeout(
+    `/api/v1/feishu/photos/${photo.id}/download-url?scope=${galleryScope.value}&watermarked=${withWatermark}`,
+    { credentials: 'include' },
+    DEFAULT_REQUEST_TIMEOUT_MS,
+  )
+  if (response.status === 401) throw new Error('登录已过期，请重新进入图片检索后再下载')
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '无法获取图片下载地址')
+  const download = await response.json() as { url?: string }
+  if (!download.url) throw new Error('图片下载地址无效')
+  await configureFeishuJsapi()
+  const localFile = await new Promise<FeishuDownloadResult>((resolve, reject) => {
+    window.tt!.downloadFile!({
+      url: download.url!,
+      success: resolve,
+      fail: () => reject(new Error('飞书下载图片失败，请检查网络后重试')),
+    })
+  })
+  if (!localFile.tempFilePath) throw new Error('飞书未返回本地图片文件')
+  await new Promise<void>((resolve, reject) => {
+    window.tt!.saveImageToPhotosAlbum!({
+      filePath: localFile.tempFilePath,
+      success: () => resolve(),
+      fail: () => reject(new Error('保存到手机相册失败，请确认飞书已获得相册权限')),
+    })
+  })
+  return true
+}
+
+async function downloadPhotoBlob(photo: GalleryPhoto, withWatermark = true) {
+  const response = await fetchWithTimeout(
+    `${galleryPhotoUrl(photo, 'download')}&watermarked=${withWatermark}`,
+    { credentials: 'include' },
+    DOWNLOAD_REQUEST_TIMEOUT_MS,
+  )
+  if (response.status === 401) throw new Error('登录已过期，请重新进入图片检索后再下载')
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '图片下载失败')
+  return {
+    blob: await response.blob(),
+    filename: downloadFileName(response, `qc-photo-${photo.id}.jpg`),
+  }
+}
+
+async function savePhotosToPhoneAlbum(photos: GalleryPhoto[], withWatermark = true) {
+  let saved = 0
+  try {
+    for (const photo of photos) {
+      if (!await savePhotoToPhoneAlbum(photo, withWatermark)) return false
+      saved += 1
+    }
+  } catch (cause) {
+    if (saved) throw new Error(`已保存 ${saved} 张，剩余图片保存失败，请重试`)
+    throw cause
+  }
+  showDownloadToast(`已保存到手机相册（共 ${saved} 张）`)
+  return true
+}
+
+async function downloadGalleryPhoto(photo: GalleryPhoto, withWatermark = true) {
+  galleryDownloadError.value = ''
+  try {
+    if (await savePhotoToPhoneAlbum(photo, withWatermark)) {
+      showDownloadToast('已保存到手机相册')
+    } else {
+      const { blob, filename } = await downloadPhotoBlob(photo, withWatermark)
+      saveDownloadedBlob(blob, filename)
+      showDownloadToast('图片下载已开始')
+    }
+  } catch (cause) {
+    galleryDownloadError.value = cause instanceof Error ? cause.message : '图片下载失败，请稍后重试'
+  }
+}
+
+async function downloadGalleryPhotos(photos = galleryPhotos.value, withWatermark = true) {
+  if (!photos.length || galleryDownloading.value) return
+  galleryDownloading.value = true
+  galleryDownloadError.value = ''
+  try {
+    if (canSaveToPhoneAlbum() && await savePhotosToPhoneAlbum(photos, withWatermark)) return
+    const response = await fetchWithTimeout('/api/v1/feishu/photos/download-batch', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scope: galleryScope.value,
+        photo_ids: [...new Set(photos.map(photo => photo.id))],
+        watermarked: withWatermark,
+      }),
+    }, DOWNLOAD_REQUEST_TIMEOUT_MS)
+    if (response.status === 401) throw new Error('登录已过期，请重新进入图片检索后再下载')
+    if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '批量下载失败')
+    const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
+    const filename = downloadFileName(response, `qc-photos-${timestamp}.zip`)
+    saveDownloadedBlob(await response.blob(), filename)
+    showDownloadToast('图片下载已开始')
+  } catch (cause) {
+    galleryDownloadError.value = cause instanceof Error ? cause.message : '批量下载失败，请稍后重试'
+  } finally {
+    galleryDownloading.value = false
+  }
+}
+
 function openGalleryPhoto(photo: GalleryPhoto) {
   selectedGalleryPhoto.value = photo
   fullPhotoLoaded.value = false
   photoRotation.value = 0
+  galleryDownloadError.value = ''
   resetPhotoZoom()
 }
 
@@ -319,6 +590,7 @@ function resetPhotoZoom() {
   photoOffsetY.value = 0
   photoDragging.value = false
   activePhotoPointers.clear()
+  gestureHadPinch = false
 }
 
 function clampScale(value: number) {
@@ -393,8 +665,11 @@ function startPhotoGesture(event: PointerEvent) {
   stage.setPointerCapture(event.pointerId)
   activePhotoPointers.set(event.pointerId, { x: event.clientX, y: event.clientY })
   if (activePhotoPointers.size === 1) {
+    gestureHadPinch = false
+    swipeOrigin = { x: event.clientX, y: event.clientY }
     panOrigin = { x: event.clientX, y: event.clientY, offsetX: photoOffsetX.value, offsetY: photoOffsetY.value }
   } else if (activePhotoPointers.size === 2) {
+    gestureHadPinch = true
     photoDragging.value = true
     beginPinch(stage)
   }
@@ -424,6 +699,16 @@ function movePhotoGesture(event: PointerEvent) {
 }
 
 function stopPhotoGesture(event: PointerEvent) {
+  const current = activePhotoPointers.get(event.pointerId)
+  const shouldNavigate = Boolean(
+    current
+    && activePhotoPointers.size === 1
+    && !gestureHadPinch
+    && photoScale.value === 1
+    && Math.abs(current.x - swipeOrigin.x) >= 60
+    && Math.abs(current.x - swipeOrigin.x) > Math.abs(current.y - swipeOrigin.y) * 1.25
+  )
+  const direction = current && current.x < swipeOrigin.x ? 1 : -1
   activePhotoPointers.delete(event.pointerId)
   const remaining = [...activePhotoPointers.values()][0]
   if (remaining) {
@@ -432,6 +717,7 @@ function stopPhotoGesture(event: PointerEvent) {
   } else {
     photoDragging.value = false
   }
+  if (shouldNavigate) navigateGalleryPhoto(direction)
 }
 
 async function openGallery() {
@@ -471,21 +757,41 @@ function openDownload(ids: string[]) {
   downloadDialogOpen.value = true
 }
 
-function confirmDownload() {
+async function confirmDownload() {
   const ids = pendingDownloadIds.value
   if (!ids.length) return
-  const query = new URLSearchParams({ scope: galleryScope.value, watermarked: String(downloadWithWatermark.value) })
-  if (ids.length === 1) {
-    const link = document.createElement('a')
-    link.href = `/api/v1/feishu/photos/${ids[0]}/download?${query}`
-    link.download = ''
-    link.click()
-  } else {
-    for (const id of ids) query.append('photo_ids', id)
-    window.location.assign(`/api/v1/feishu/photos/download-batch?${query}`)
-  }
-  selectedGalleryPhotoIds.value = new Set()
   downloadDialogOpen.value = false
+  galleryDownloading.value = true
+  galleryDownloadError.value = ''
+  const withWatermark = downloadWithWatermark.value
+  const chosenPhotos = galleryPhotos.value.filter(photo => ids.includes(photo.id))
+  try {
+    if (canSaveToPhoneAlbum() && await savePhotosToPhoneAlbum(chosenPhotos, withWatermark)) {
+      selectedGalleryPhotoIds.value = new Set()
+      return
+    }
+    if (ids.length === 1) {
+      const { blob, filename } = await downloadPhotoBlob(chosenPhotos[0], withWatermark)
+      saveDownloadedBlob(blob, filename)
+    } else {
+      const response = await fetchWithTimeout('/api/v1/feishu/photos/download-batch', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scope: galleryScope.value, photo_ids: ids, watermarked: withWatermark }),
+      }, DOWNLOAD_REQUEST_TIMEOUT_MS)
+      if (response.status === 401) throw new Error('登录已过期，请重新进入图片检索后再下载')
+      if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || '批量下载失败')
+      const timestamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+/, '')
+      saveDownloadedBlob(await response.blob(), downloadFileName(response, `qc-photos-${timestamp}.zip`))
+    }
+    selectedGalleryPhotoIds.value = new Set()
+    showDownloadToast('图片下载已开始')
+  } catch (cause) {
+    galleryDownloadError.value = cause instanceof Error ? cause.message : '图片下载失败，请稍后重试'
+  } finally {
+    galleryDownloading.value = false
+  }
 }
 
 async function openTask(recordId: string) {
@@ -530,7 +836,7 @@ async function configureFeishuJsapi() {
     const signature = await response.json()
     await new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => reject(new Error('飞书拍照服务初始化超时，请检查网络后重试')), 12_000)
-      window.h5sdk!.config({ appId: signature.app_id, timestamp: signature.timestamp, nonceStr: signature.noncestr, signature: signature.signature, jsApiList: ['chooseImage'] })
+      window.h5sdk!.config({ appId: signature.app_id, timestamp: signature.timestamp, nonceStr: signature.noncestr, signature: signature.signature, jsApiList: ['chooseImage', 'downloadFile', 'saveImageToPhotosAlbum'] })
       window.h5sdk!.ready(() => { window.clearTimeout(timer); resolve() })
       window.h5sdk!.error?.((cause) => { window.clearTimeout(timer); reject(cause) })
     })
@@ -837,6 +1143,7 @@ function selectTask(index: number) {
 onMounted(async () => {
   if (isDesktopGalleryRoute) return
   document.addEventListener('visibilitychange', handleCameraVisibilityChange)
+  window.addEventListener('keydown', handleGalleryViewerKeydown)
   // Local draft cleanup must never delay login or the homepage, especially in
   // iOS WebViews where IndexedDB may be unavailable.
   void cleanExpiredDrafts()
@@ -844,6 +1151,8 @@ onMounted(async () => {
 })
 onUnmounted(() => {
   document.removeEventListener('visibilitychange', handleCameraVisibilityChange)
+  window.removeEventListener('keydown', handleGalleryViewerKeydown)
+  window.clearTimeout(downloadToastTimer)
   closeH5Camera()
   releaseH5CameraStream()
 })
@@ -898,7 +1207,7 @@ onUnmounted(() => {
           <div v-if="submitStatus !== 'idle'" class="upload-overlay"><div class="upload-dialog"><div v-if="submitStatus === 'uploading'" class="spinner"/><b>{{ submitStatus === 'uploading' ? '正在上传图片…' : submitStatus === 'success' ? (submitMode === 'save' ? '暂存成功' : '提交成功') : '上传失败' }}</b><p>{{ submitStatus === 'uploading' ? '请勿关闭当前页面' : submitStatus === 'success' ? (submitMode === 'save' ? '图片已上传，可在图片检索中查看；任务状态未变更' : '当前规格任务已完成') : submitError }}</p><button v-if="submitStatus === 'error'" @click="submitStatus = 'idle'">知道了</button></div></div>
         </section>
 
-        <section v-else class="screen gallery-screen">
+        <section v-else class="screen gallery-screen" :class="{ 'selection-mode': gallerySelecting }">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>图片检索</strong><span class="header-space"/></header>
           <div class="tabs gallery-tabs"><button :class="{ active: galleryScope === 'mine' }" @click="selectGalleryScope('mine')">我拍摄的</button><button :class="{ active: galleryScope === 'shared' }" @click="selectGalleryScope('shared')">与我共享</button></div>
           <div class="gallery-search"><span aria-hidden="true">⌕</span><input v-model="gallerySearch" type="search" placeholder="搜索合同、产品、规格、部位…" maxlength="200" @input="scheduleGallerySearch" @keyup.enter="loadGallery()"><button v-if="gallerySearch" aria-label="清除搜索" @click="clearGallerySearch">×</button></div>
@@ -932,6 +1241,7 @@ onUnmounted(() => {
             <span>已选 {{ selectedGalleryPhotoIds.size }} 张</span>
             <button class="batch-download" :disabled="!selectedGalleryPhotoIds.size" @click="openDownload([...selectedGalleryPhotoIds])">批量下载</button>
           </div>
+          <p v-if="galleryDownloadError" class="camera-error">{{ galleryDownloadError }}</p>
           <p v-if="galleryError" class="camera-error">{{ galleryError }}</p><p v-else-if="galleryLoading" class="empty">正在加载图片…</p><p v-else-if="!galleryPhotos.length" class="empty">没有符合当前筛选条件的已上传图片</p>
           <div v-else class="gallery" :class="{ grid: galleryView === 'grid' }">
             <div v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" :class="{ 'is-selected': selectedGalleryPhotoIds.has(photo.id) }">
@@ -949,12 +1259,15 @@ onUnmounted(() => {
           </nav>
         </section>
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
-          <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}</small></div><div class="viewer-actions"><button class="rotate-button" aria-label="将照片顺时针旋转90度" @click="rotateGalleryPhoto"><span aria-hidden="true">↻</span> 旋转 90°</button><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></div></header>
+          <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}<template v-if="selectedGalleryIndex >= 0"> · {{ selectedGalleryIndex + 1 }} / {{ galleryPhotos.length }}</template></small></div><div class="viewer-actions"><button class="rotate-button" aria-label="将照片顺时针旋转90度" @click="rotateGalleryPhoto"><span aria-hidden="true">↻</span> 旋转 90°</button><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></div></header>
+          <p v-if="galleryDownloadError" class="viewer-error">{{ galleryDownloadError }}</p>
           <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
             <img class="viewer-preview" :class="{ 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded, 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
-            <span v-else-if="photoScale === 1" class="gesture-hint">双指捏合缩放 · 放大后单指拖动</span>
+            <span v-else-if="photoScale === 1" class="gesture-hint">左右滑动切换 · 双指捏合缩放</span>
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
+            <button class="photo-nav previous" :disabled="!hasPreviousGalleryPhoto" aria-label="上一张照片" @pointerdown.stop @click.stop="navigateGalleryPhoto(-1)">‹</button>
+            <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @click.stop="navigateGalleryPhoto(1)">›</button>
           </div>
         </div>
         <DownloadOptionsDialog
@@ -971,6 +1284,7 @@ onUnmounted(() => {
           <p v-if="cameraError" class="h5-camera-error">{{ cameraError }}</p>
           <footer class="h5-camera-actions"><button class="h5-camera-alternative" :disabled="h5CameraPending > 0" @click="switchToFeishuCamera">飞书相机</button><button class="h5-camera-shutter" :disabled="!h5CameraReady || h5CameraPending >= 3" aria-label="拍照" @click="takeH5Photo"><span/></button><button class="h5-camera-done" :disabled="h5CameraPending > 0" @click="closeH5Camera">完成</button></footer>
         </div>
+        <div v-if="downloadToast" class="download-toast" role="status" aria-live="polite">{{ downloadToast }}</div>
         <nav class="nav"><button :class="{ active: page === 'home' }" @click="page = 'home'"><i>⌂</i><span>首页</span></button><button :class="{ active: page === 'capture' }" @click="openFirstTask"><i>◉</i><span>拍照任务</span></button><button :class="{ active: page === 'gallery' }" @click="openGallery"><i>▣</i><span>图片检索</span></button></nav>
       </template>
     </div>
@@ -1041,5 +1355,12 @@ onUnmounted(() => {
 .photo-viewer .viewer-actions .rotate-button span{display:inline-block;margin-right:2px;font-size:17px;vertical-align:-1px}
 .photo-viewer .viewer-actions .viewer-download{background:#3370ff}
 .photo-stage img.quarter-turn{width:min(92vh,94vw);height:min(92vh,94vw);max-width:none;max-height:none;object-fit:contain}
+.photo-viewer .viewer-error{flex:none;padding:8px 12px;background:#9b2b2b;color:#fff;font-size:12px;text-align:center}
+.photo-stage .photo-nav{position:absolute;z-index:6;top:50%;width:38px;height:58px;padding:0;transform:translateY(-50%);border-radius:10px;background:#17212bc9;color:#fff;font-size:36px;line-height:1;display:grid;place-items:center;backdrop-filter:blur(4px)}
+.photo-stage .photo-nav.previous{left:10px}
+.photo-stage .photo-nav.next{right:10px}
+.photo-stage .photo-nav:disabled{opacity:.25;pointer-events:none}
+.download-toast{position:absolute;z-index:55;left:50%;bottom:82px;transform:translateX(-50%);max-width:calc(100% - 44px);padding:9px 14px;border-radius:16px;background:#303844e8;color:#fff;box-shadow:0 7px 22px #17233c33;font-size:12px;line-height:18px;text-align:center;pointer-events:none;animation:toast-in .18s ease-out}
+@keyframes toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
 @media(max-width:390px){.photo-viewer header{grid-template-columns:34px minmax(0,1fr) auto;padding:8px 7px}.photo-viewer .viewer-actions .rotate-button{padding:0 6px;font-size:11px}.photo-viewer .viewer-actions .viewer-download{padding:0 6px}.gallery-pagination{gap:4px}.gallery-pagination button{padding:0 6px}}
 </style>

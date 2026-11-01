@@ -1,8 +1,8 @@
-from datetime import datetime
+from datetime import UTC, datetime
 
 import pytest
 
-from app.api.feishu import _zip_filename
+from app.api.feishu import _archive_photo_name
 from app.services import dashboard_repository
 
 
@@ -99,26 +99,34 @@ async def test_gallery_rejects_page_sizes_above_fifty() -> None:
 
 @pytest.mark.asyncio
 async def test_batch_download_resolves_unwatermarked_originals_in_selection_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    first_id = "00000000-0000-0000-0000-000000000001"
+    second_id = "00000000-0000-0000-0000-000000000002"
     rows = [
-        {"id": "photo-2", "object_key": "photos/2-original.jpg", "original_filename": "2.jpg", "contract_no": "C2", "inspection_item": "尺寸"},
-        {"id": "photo-1", "object_key": "photos/1-original.jpg", "original_filename": "1.jpg", "contract_no": "C1", "inspection_item": "材质光谱"},
+        {"id": second_id, "object_key": "photos/2-original.jpg", "contract_no": "C2", "inspection_item": "尺寸"},
+        {"id": first_id, "object_key": "photos/1-original.jpg", "contract_no": "C1", "inspection_item": "材质光谱"},
     ]
     connection = FakeConnection(rows)
     monkeypatch.setattr(dashboard_repository.asyncpg, "connect", lambda _: _connection(connection))
 
-    documents = await dashboard_repository.photo_download_objects_for_user(
-        "user-id", ["photo-2", "photo-1"], scope="shared", watermarked=False,
+    documents = await dashboard_repository.photo_downloads_for_user(
+        "user-id", [second_id, first_id], scope="shared", watermarked=False,
     )
 
     assert "p.original_oss_object_key" in connection.query
-    assert [document["id"] for document in documents] == ["photo-2", "photo-1"]
+    assert [document["id"] for document in documents] == [second_id, first_id]
     assert documents[0]["object_key"] == "photos/2-original.jpg"
 
 
 def test_batch_download_filename_cannot_escape_archive_directory() -> None:
-    filename = _zip_filename(
-        {"id": "../../photo-1", "contract_no": "C/1", "inspection_item": "尺寸"},
-        1,
+    filename = _archive_photo_name(
+        {
+            "id": "../../photo-1",
+            "contract_no": "C/1",
+            "product_type": "法兰",
+            "specification": "DN50",
+            "inspection_item": "尺寸",
+            "captured_at": datetime(2026, 11, 1, 10, 36, tzinfo=UTC),
+        },
     )
 
     assert "/" not in filename
