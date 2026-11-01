@@ -126,7 +126,11 @@ function datePreset(days: number | 'month') {
 function photoUrl(photo: GalleryPhoto, kind: 'preview' | 'full' | 'download') { return `/api/v1/feishu/photos/${photo.id}/${kind}?scope=${scope.value}` }
 function formatDate(value: string) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? '未知时间' : date.toLocaleString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }) }
 function openPhoto(photo: GalleryPhoto) { selected.value = photo; fullLoaded.value = false; rotation.value = 0; downloadError.value = '' }
-function rotatePhoto() { rotation.value = (rotation.value + 90) % 360 }
+function rotatePhoto() { rotation.value += 90 }
+function handleViewerDoubleClick(event: MouseEvent) {
+  if (event.target instanceof Element && event.target.closest('button')) return
+  rotatePhoto()
+}
 function togglePhoto(photoId: string, extendRange = false) {
   const next = new Set(selectedPhotoIds.value)
   if (extendRange && selectionAnchorId) {
@@ -323,7 +327,7 @@ onUnmounted(() => {
     <div v-if="selected" class="viewer" role="dialog" aria-modal="true" :aria-label="`${selected.contract_no} 照片预览`" @click.self="selected = null">
       <header><div><p>{{ selected.contract_no }} <template v-if="selectedIndex >= 0">· {{ selectedIndex + 1 }} / {{ photos.length }}</template></p><b>{{ selected.product_type }}<template v-if="selected.specification"> · {{ selected.specification }}</template> · {{ selected.inspection_item }}</b></div><div class="viewer-actions"><button class="download-button" @click="openDownload([selected.id])">⇩ 下载</button><button class="close-button" aria-label="关闭预览" @click="selected = null">×</button></div></header>
       <p v-if="downloadError" class="viewer-error">{{ downloadError }}</p>
-      <div class="viewer-stage" @dblclick.stop="rotatePhoto" @pointerdown="startSwipe" @pointerup="endSwipe" @pointercancel="cancelSwipe"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span><button class="viewer-nav previous" :disabled="!hasPrevious" aria-label="上一张照片" @pointerdown.stop @click="navigatePhoto(-1)">‹</button><button class="viewer-nav next" :disabled="!hasNext" aria-label="下一张照片" @pointerdown.stop @click="navigatePhoto(1)">›</button></div>
+      <div class="viewer-stage" @dblclick.stop="handleViewerDoubleClick" @pointerdown="startSwipe" @pointerup="endSwipe" @pointercancel="cancelSwipe"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span><button class="viewer-nav previous" :disabled="!hasPrevious" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(-1)">‹</button><button class="viewer-nav next" :disabled="!hasNext" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(1)">›</button></div>
       <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="selected.inspection_note"> · 备注：{{ selected.inspection_note }}</template><template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>← → / 滑动切换 · 双击旋转 · Esc 关闭</span></footer>
     </div>
     <DownloadOptionsDialog

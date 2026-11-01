@@ -598,9 +598,14 @@ function clampScale(value: number) {
 }
 
 function rotateGalleryPhoto() {
-  photoRotation.value = (photoRotation.value + 90) % 360
+  photoRotation.value += 90
   photoOffsetX.value = 0
   photoOffsetY.value = 0
+}
+
+function handlePhotoStageDoubleClick(event: MouseEvent) {
+  if (event.target instanceof Element && event.target.closest('button')) return
+  rotateGalleryPhoto()
 }
 
 function pointerDistance(first: { x: number; y: number }, second: { x: number; y: number }) {
@@ -1290,13 +1295,13 @@ onUnmounted(() => {
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
           <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}<template v-if="selectedGalleryIndex >= 0"> · {{ selectedGalleryIndex + 1 }} / {{ galleryPhotos.length }}</template></small></div><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></header>
           <p v-if="galleryDownloadError" class="viewer-error">{{ galleryDownloadError }}</p>
-          <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @dblclick.stop="rotateGalleryPhoto" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
+          <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @dblclick.stop="handlePhotoStageDoubleClick" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
             <img class="viewer-preview" :class="{ 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded, 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
             <span v-else-if="photoScale === 1" class="gesture-hint">左右滑动切换 · 双指捏合缩放 · 双击旋转</span>
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
-            <button class="photo-nav previous" :disabled="!hasPreviousGalleryPhoto" aria-label="上一张照片" @pointerdown.stop @click.stop="navigateGalleryPhoto(-1)">‹</button>
-            <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @click.stop="navigateGalleryPhoto(1)">›</button>
+            <button class="photo-nav previous" :disabled="!hasPreviousGalleryPhoto" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(-1)">‹</button>
+            <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(1)">›</button>
           </div>
         </div>
         <DownloadOptionsDialog
@@ -1341,7 +1346,7 @@ onUnmounted(() => {
 .h5-camera-header b{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:15px}
 .h5-camera-header small{font-size:11px;color:#c3cad2}
 .h5-camera-preview{position:relative;flex:1 1 0;min-height:0;overflow:hidden;background:#050607}
-.h5-camera-preview video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:contain;opacity:0}
+.h5-camera-preview video{position:absolute;inset:0;display:block;width:100%;height:100%;object-fit:cover;object-position:center;opacity:0}
 .h5-camera-preview video.ready{opacity:1}
 .h5-camera-preview p{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);white-space:nowrap;padding:7px 12px;border-radius:15px;background:#0009;font-size:12px}
 .h5-camera-error{flex:none;margin:0;padding:8px 12px;background:#9b2b2b;color:#fff;font-size:12px;text-align:center}
