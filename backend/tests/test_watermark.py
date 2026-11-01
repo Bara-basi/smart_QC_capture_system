@@ -32,10 +32,10 @@ def test_rendered_image_is_a_valid_jpeg() -> None:
     assert image.startswith(b"\xff\xd8\xff")
 
 
-def test_watermark_font_is_at_least_three_times_the_previous_size() -> None:
+def test_watermark_font_is_one_and_a_half_times_the_original_size() -> None:
     for width, height in ((800, 1200), (1920, 1080), (4000, 3000)):
         previous_size = max(20, min(54, round(min(width, height) * 0.045)))
-        assert watermark_font_size(width, height) >= previous_size * 3
+        assert watermark_font_size(width, height) == previous_size * 3 // 2
 
 
 def test_unwatermarked_render_is_a_valid_jpeg() -> None:

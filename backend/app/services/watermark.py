@@ -91,9 +91,9 @@ def render_unwatermarked(image_bytes: bytes) -> tuple[bytes, str]:
 
 
 def watermark_font_size(width: int, height: int) -> int:
-    """Use exactly three times the former font size so labels remain consistently legible."""
+    """Use 1.5 times the former font size, half of the previous enlarged label."""
     previous_size = max(20, min(54, round(min(width, height) * 0.045)))
-    return previous_size * 3
+    return previous_size * 3 // 2
 
 
 def _wrap_watermark_lines(
@@ -103,7 +103,7 @@ def _wrap_watermark_lines(
     max_width: int,
     stroke_width: int,
 ) -> str:
-    """Wrap oversized labels while retaining the enlarged three-times font size."""
+    """Wrap oversized labels while retaining the enlarged font size."""
     wrapped: list[str] = []
     for line in lines:
         if draw.textlength(line, font=font) <= max_width:
