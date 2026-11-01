@@ -10,7 +10,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
 
 _FACTORY_SUFFIX = re.compile(r"^(?P<contract>.+?)-(?P<factory>[A-Za-z]+)$")
 _CONTRACT_PREFIX = re.compile(r"^(?P<year>\d{2})(?P<company>[A-Za-z]+)-(?P<employee>\d{2})(?P<code>[A-Za-z])(?P<order>\d+)$")
-_FONT_PATHS = ("C:/Windows/Fonts/msyh.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+_FONT_PATHS = (
+    "C:/Windows/Fonts/msyh.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 
 
 class WatermarkError(ValueError):
