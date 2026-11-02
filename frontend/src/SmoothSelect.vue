@@ -84,17 +84,19 @@ onUnmounted(() => {
 .smooth-select{display:inline-flex;min-width:0;color:#596575;font-size:12px}
 .smooth-select .select-trigger{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;min-width:100px;height:34px;padding:0 11px;border:1px solid #e1e7ef;border-radius:10px;background:#fff;color:#596575;font:inherit;cursor:pointer;transition:border-color .16s,box-shadow .16s}
 .select-trigger>span{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.select-trigger svg{width:14px;height:14px;flex:none;color:#8795a6;transition:transform .18s}
-.smooth-select .select-trigger:hover{border-color:#b9ccef}.smooth-select .select-trigger.open,.smooth-select .select-trigger:focus-visible{border-color:#8bb1ff;outline:none;box-shadow:0 0 0 3px #3370ff12}.select-trigger.open svg{transform:rotate(180deg)}
+.smooth-select .select-trigger:hover{border-color:#b8c3cf}.smooth-select .select-trigger.open,.smooth-select .select-trigger:focus{outline:none;box-shadow:none}.smooth-select .select-trigger:focus-visible{outline:2px solid #8d9aaa;outline-offset:3px}.select-trigger.open svg{transform:rotate(180deg)}
 .smooth-options{position:fixed;z-index:160;overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:6px;border:1px solid #e5eaf2;border-radius:14px;background:#fff;color:#445063;box-shadow:0 12px 36px #2237561c,0 3px 8px #2237560a;font:13px/1.4 Inter,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}
 .smooth-option{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:36px;padding:7px 10px;border-radius:9px;cursor:pointer}.smooth-option.active{background:#f3f6fb}.smooth-option.selected{background:#edf3ff;color:#2863db;font-weight:600}.smooth-option svg{width:17px;height:17px;flex:none}
 .select-panel-enter-active,.select-panel-leave-active{transition:opacity .14s,transform .14s}.select-panel-enter-from,.select-panel-leave-to{opacity:0;transform:translateY(-4px)}
 @media(prefers-reduced-motion:reduce){.select-panel-enter-active,.select-panel-leave-active{transition:none}}
 
 .smooth-select .select-trigger.task-select-trigger{min-width:0;gap:8px;padding:0 10px;border-color:#dfe5ec;border-radius:8px;color:#596573;text-align:left}
-.smooth-select .task-select-trigger.open{border-color:#8eb1ff;background:#f4f7ff;color:#2863db}
+.smooth-select .task-select-trigger.open{border-color:#dfe5ec;background:#fff;color:#596573}
 .task-select-trigger>span{flex:1}.task-select-trigger svg{width:12px;height:12px}
 .task-options{padding:8px;border-radius:16px;box-shadow:0 10px 28px #17233c1a}
 .task-options .smooth-option{display:block;min-height:46px;padding:0;border-radius:10px}
 .task-options .smooth-option+.smooth-option{margin-top:3px}
 .task-options .smooth-option.selected{background:#eaf1ff}
+
+.smooth-select,.smooth-select *,.smooth-options,.smooth-options *{-webkit-tap-highlight-color:transparent}
 </style>
