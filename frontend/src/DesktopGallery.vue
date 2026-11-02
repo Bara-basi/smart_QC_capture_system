@@ -359,9 +359,9 @@ onUnmounted(() => {
 .photo-select.checked{border-color:#3370ff;background:#3370ff;color:#fff}
 .photo-select:focus-within{outline:3px solid #3370ff2b;outline-offset:2px}
 .photo-grid.list .photo-card{display:flex;align-items:center}
-.photo-grid.list .photo-open{display:flex;align-items:center;min-width:0}
-.photo-grid.list .photo-select{left:10px;top:50%;transform:translateY(-50%)}
-.photo-grid.list .photo-card img{margin-left:24px}
+.photo-grid.list .photo-open{display:flex;align-items:center;min-width:0;padding-right:62px}
+.photo-grid.list .photo-select{left:auto;right:20px;top:50%;transform:translateY(-50%)}
+.photo-grid.list .photo-card img{margin-left:0}
 .pagination{display:flex;align-items:center;justify-content:center;gap:7px;margin-top:24px}
 .pagination button{min-width:34px;height:34px;padding:0 11px;border:1px solid #dfe3e8;border-radius:7px;background:#fff;color:#596473;font:inherit;font-size:12px;cursor:pointer}
 .pagination button.active{border-color:#3370ff;background:#3370ff;color:#fff;font-weight:700}
