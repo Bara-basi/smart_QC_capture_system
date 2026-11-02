@@ -1471,4 +1471,30 @@ input,textarea{accent-color:#3370ff}
 @media(max-width:600px){.capture-scroll{padding-bottom:calc(190px + env(safe-area-inset-bottom))}}
 
 .filter-panel{border-radius:16px;border-color:#e5eaf2;box-shadow:0 12px 32px #22375612}.option-panel button{border-radius:10px}
+
+/* A 44px selection target contains the compact visual checkbox. */
+.gallery-select{width:44px;height:44px;top:4px;left:4px;border:0;border-radius:0;background:transparent;box-shadow:none}
+.gallery-select.checked{border:0;background:transparent;box-shadow:none}
+.gallery-select>span{display:grid;place-items:center;width:22px;height:22px;border:1.5px solid #c9d2de;border-radius:7px;background:#fff;box-shadow:0 1px 4px #18233810}
+.gallery-select.checked>span{border-color:#3370ff;background:#3370ff;color:#fff}
+.gallery-select:focus-within,.gallery-select:has(input:focus-visible){outline:none}
+.gallery-select:has(input:focus-visible)>span{outline:2px solid #3370ff;outline-offset:3px}
+
+.gallery.grid .gallery-select{top:4px;left:4px}
+.photo-viewer,.h5-camera{background:#f5f7fa;color:#293342}
+.photo-viewer header,.h5-camera-header{background:#fff;border-bottom:1px solid #e5eaf0;color:#293342}
+.photo-viewer header button,.h5-camera-header button{color:#526174}
+.photo-viewer header small,.h5-camera-header small{color:#8792a1}
+.photo-viewer .viewer-download{color:#fff;background:#3370ff}
+.photo-stage,.h5-camera-preview{background:#f5f7fa}
+.viewer-preview{opacity:1;filter:none}
+.photo-stage .photo-nav{color:#3370ff;filter:none}
+.gesture-hint,.zoom-level,.hd-loading,.h5-camera-preview p{background:#ffffffed;border:1px solid #e5eaf0;color:#69788b;box-shadow:0 2px 8px #2237560a}
+.h5-camera-actions{background:#fff;border-top:1px solid #e5eaf0}
+.h5-camera-alternative{color:#3370ff;padding:10px 12px;border-radius:9px;background:#edf3ff}
+.h5-camera-done{color:#fff;padding:10px 18px;border-radius:9px;background:#3370ff}
+.h5-camera-shutter{border-color:#3370ff;background:#fff;box-shadow:0 4px 14px #3370ff20}
+.h5-camera-shutter span{background:#3370ff}
+.h5-camera-error,.photo-viewer .viewer-error{background:#fff1f0;color:#b54840;border-bottom:1px solid #f5d9d5}
+
 </style>

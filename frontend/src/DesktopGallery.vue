@@ -397,4 +397,29 @@ onUnmounted(() => {
 
 .filters .smooth-select{min-width:158px}.filters input{border-radius:10px}
 @media(max-width:780px){.filters .smooth-select{width:100%;min-width:0}}
+
+/* A 44px selection target contains the compact visual checkbox. */
+.desktop-gallery .photo-select{width:44px;height:44px;top:4px;left:4px;border:0;border-radius:0;background:transparent;box-shadow:none}
+.desktop-gallery .photo-select.checked{border:0;background:transparent;box-shadow:none}
+.desktop-gallery .photo-select>span{display:grid;place-items:center;width:22px;height:22px;border:1.5px solid #c9d2de;border-radius:7px;background:#fff;box-shadow:0 1px 4px #18233810}
+.desktop-gallery .photo-select.checked>span{border-color:#3370ff;background:#3370ff;color:#fff}
+.desktop-gallery .photo-select:focus-within,.desktop-gallery .photo-select:has(input:focus-visible){outline:none}
+.desktop-gallery .photo-select:has(input:focus-visible)>span{outline:2px solid #3370ff;outline-offset:3px}
+
+.desktop-gallery .photo-grid.list .photo-select{right:9px;left:auto}
+.viewer{background:#f5f7fa;color:#293342;backdrop-filter:none}
+.viewer header,.viewer footer{background:#fff;border-color:#e5eaf0;color:#69788b}
+.viewer header{border-bottom:1px solid #e5eaf0}
+.viewer footer{border-top:1px solid #e5eaf0}
+.viewer header p{color:#293342}.viewer header b{color:#8792a1}
+.viewer-stage{background:#f5f7fa}
+.viewer-stage .preview{opacity:1;filter:none}
+.viewer-stage>span{background:#ffffffed;border:1px solid #e5eaf0;color:#69788b}
+.viewer-stage .viewer-nav{color:#3370ff;filter:none}
+.viewer header .viewer-actions button{background:#edf3ff;border-color:#dde7f8;color:#3370ff}
+.viewer header .viewer-actions .download-button{background:#3370ff;border-color:#3370ff;color:#fff}
+.viewer header .viewer-actions .close-button{background:transparent;color:#526174}
+.viewer header .viewer-actions button:focus-visible{outline-color:#3370ff}
+.viewer .viewer-error{background:#fff1f0;color:#b54840}
+
 </style>
