@@ -1285,6 +1285,7 @@ onUnmounted(() => {
             <div class="gallery-count"><b>共 {{ galleryTotal }} 张照片</b><small>第 {{ galleryPage }} / {{ Math.max(galleryTotalPages, 1) }} 页 · 每页 {{ galleryPageSize }} 张</small></div>
             <div class="gallery-actions"><button class="sort-button" :title="gallerySort === 'desc' ? '当前：最近拍摄在前' : '当前：最早拍摄在前'" @click="gallerySort = gallerySort === 'desc' ? 'asc' : 'desc'; loadGallery()">{{ gallerySort === 'desc' ? '↓' : '↑' }} 时间</button><button :class="{ active: galleryView === 'grid' }" title="卡片显示" @click="galleryView = 'grid'">▦</button><button :class="{ active: galleryView === 'list' }" title="记录显示" @click="galleryView = 'list'">☷</button></div>
           </div>
+          <div class="page-size-control"><span>分页显示</span><label>每页 <select v-model.number="galleryPageSize" @change="loadGallery()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label></div>
           <div v-if="galleryPhotos.length && !galleryLoading" class="gallery-batch-bar">
             <button @click="toggleGalleryPageSelection">{{ galleryPhotos.every(photo => selectedGalleryPhotoIds.has(photo.id)) ? '取消全选' : '全选本页' }}</button>
             <span>已选 {{ selectedGalleryPhotoIds.size }} 张</span>
@@ -1301,7 +1302,6 @@ onUnmounted(() => {
               <button class="gallery-open" @click="openGalleryPhoto(photo)"><img loading="lazy" decoding="async" class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button>
             </div>
           </div>
-          <div class="page-size-control"><span>共 {{ galleryTotal }} 张</span><label>每页 <select v-model.number="galleryPageSize" @change="loadGallery()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label></div>
           <nav v-if="galleryTotalPages > 1 && !galleryLoading" class="gallery-pagination" aria-label="照片分页">
             <button :disabled="galleryPage === 1" @click="goToGalleryPage(galleryPage - 1)">‹ 上一页</button>
             <button v-for="page in galleryPageNumbers" :key="page" :class="{ active: page === galleryPage }" :aria-current="page === galleryPage ? 'page' : undefined" @click="goToGalleryPage(page)">{{ page }}</button>
