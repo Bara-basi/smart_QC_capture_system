@@ -546,7 +546,6 @@ async function downloadGalleryPhotos(photos = galleryPhotos.value, withWatermark
   galleryDownloading.value = true
   galleryDownloadError.value = ''
   try {
-    if (canSaveToPhoneAlbum() && await savePhotosToPhoneAlbum(photos, withWatermark)) return
     const response = await fetchWithTimeout('/api/v1/feishu/photos/download-batch', {
       method: 'POST',
       credentials: 'include',
@@ -665,6 +664,7 @@ function onPhotoWheel(event: WheelEvent) {
 }
 
 function startPhotoGesture(event: PointerEvent) {
+  if (event.pointerType === 'mouse' && event.button !== 0) return
   if (activePhotoPointers.size >= 2) return
   const stage = event.currentTarget as HTMLElement
   stage.setPointerCapture(event.pointerId)
@@ -771,7 +771,7 @@ async function confirmDownload() {
   const withWatermark = downloadWithWatermark.value
   const chosenPhotos = galleryPhotos.value.filter(photo => ids.includes(photo.id))
   try {
-    if (canSaveToPhoneAlbum() && await savePhotosToPhoneAlbum(chosenPhotos, withWatermark)) {
+    if (ids.length === 1 && canSaveToPhoneAlbum() && await savePhotosToPhoneAlbum(chosenPhotos, withWatermark)) {
       selectedGalleryPhotoIds.value = new Set()
       return
     }
@@ -1295,7 +1295,7 @@ onUnmounted(() => {
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
           <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}<template v-if="selectedGalleryIndex >= 0"> · {{ selectedGalleryIndex + 1 }} / {{ galleryPhotos.length }}</template></small></div><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></header>
           <p v-if="galleryDownloadError" class="viewer-error">{{ galleryDownloadError }}</p>
-          <div class="photo-stage" :class="{ dragging: photoDragging }" @contextmenu.prevent @wheel.prevent="onPhotoWheel" @dblclick.stop="handlePhotoStageDoubleClick" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
+          <div class="photo-stage" :class="{ dragging: photoDragging }" @wheel.prevent="onPhotoWheel" @dblclick.stop="handlePhotoStageDoubleClick" @pointerdown="startPhotoGesture" @pointermove="movePhotoGesture" @pointerup="stopPhotoGesture" @pointercancel="stopPhotoGesture">
             <img class="viewer-preview" :class="{ 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'preview')" alt="" :style="{ transform: photoTransform }"><img ref="viewerImage" class="viewer-full" :class="{ loaded: fullPhotoLoaded, 'quarter-turn': photoRotation % 180 !== 0 }" :src="galleryPhotoUrl(selectedGalleryPhoto, 'full')" :alt="`${selectedGalleryPhoto.contract_no} 高清照片`" :style="{ transform: photoTransform }" @load="fullPhotoLoaded = true">
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
             <span v-else-if="photoScale === 1" class="gesture-hint">左右滑动切换 · 双指捏合缩放 · 双击旋转</span>
