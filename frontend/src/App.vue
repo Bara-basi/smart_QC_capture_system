@@ -1229,8 +1229,9 @@ onUnmounted(() => {
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
           <div class="task-sequence-sticky">
             <span class="task-sequence-label">合同序号</span>
-            <SmoothSelect v-model="openSubtask" class="task-sequence-picker" label="合同序号" :options="activeTask.tasks.map((task, index) => ({ value: index, label: taskSequence(task, index) + ' · ' + (task.specification || '未填写规格') + ' · ' + task.product_type + (uploadedTaskIds.has(task.feishu_record_id) ? ' · 已提交' : ' · 待完成') }))" @change="selectTask(openSubtask)">
+            <SmoothSelect v-model="openSubtask" class="task-sequence-picker" variant="task" label="合同序号" :options="activeTask.tasks.map((task, index) => ({ value: index, label: taskSequence(task, index) + ' · ' + (task.specification || '未填写规格') + ' · ' + task.product_type + (uploadedTaskIds.has(task.feishu_record_id) ? ' · 已提交' : ' · 待完成') }))" @change="selectTask(openSubtask)">
               <template #selected><span v-if="currentTask" class="task-sequence-current"><b>{{ taskSequence(currentTask, openSubtask) }}</b><span>{{ currentTask.specification || '未填写规格' }} · {{ currentTask.product_type }}</span></span></template>
+              <template #option="{ option }"><div class="task-sequence-option"><b>{{ taskSequence(activeTask!.tasks[option.value], option.value) }}</b><span>{{ activeTask!.tasks[option.value].specification || '未填写规格' }} · {{ activeTask!.tasks[option.value].product_type }}</span><small :class="{ done: uploadedTaskIds.has(activeTask!.tasks[option.value].feishu_record_id) }">{{ uploadedTaskIds.has(activeTask!.tasks[option.value].feishu_record_id) ? '已提交' : '待完成' }}</small></div></template>
             </SmoothSelect>
           </div>
           <p class="hint">带 <em>*</em> 的项目为必拍项；点击右侧任务栏可切换其它子任务。</p>
@@ -1497,4 +1498,11 @@ input,textarea{accent-color:#3370ff}
 .h5-camera-shutter span{background:#3370ff}
 .h5-camera-error,.photo-viewer .viewer-error{background:#fff1f0;color:#b54840;border-bottom:1px solid #f5d9d5}
 
+
+.task-sequence-option{width:100%;min-height:46px;display:grid;grid-template-columns:34px minmax(0,1fr) auto;align-items:center;gap:8px;padding:7px 9px;color:#4c5663;text-align:left;font-size:12px}
+.task-sequence-option b{display:grid;place-items:center;min-height:28px;padding:2px 6px;border-radius:6px;background:#f2f5f9;color:#53606e;font-size:12px}
+.task-sequence-option>span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-sequence-option small{color:#9a7443;font-size:10px}.task-sequence-option small.done{color:#1d9b64}
+.task-options .smooth-option.selected .task-sequence-option{color:#2863db;font-weight:600}
+.task-options .smooth-option.selected .task-sequence-option b{background:#3370ff;color:#fff}
 </style>
