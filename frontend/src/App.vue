@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useNavigationHistory } from './navigationHistory'
+import ExitConfirmationDialog from './ExitConfirmationDialog.vue'
 import DesktopGallery from './DesktopGallery.vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
@@ -26,6 +27,7 @@ declare global {
   interface Window {
     h5sdk?: { config: (options: Record<string, unknown>) => void; ready: (callback: () => void) => void; error?: (callback: (error: unknown) => void) => void }
     tt?: {
+      closeWindow?: (options: FeishuCallbackOptions) => void
       chooseImage: (options: { count: number; sourceType: string[]; sizeType?: string[]; success: (result: FeishuChooseImageResult) => void; fail: (error: unknown) => void }) => void
       getFileSystemManager?: () => FileSystemManager
       downloadFile?: (options: { url: string; success: (result: FeishuDownloadResult) => void; fail: (error: unknown) => void }) => void
@@ -842,7 +844,7 @@ async function configureFeishuJsapi() {
     const signature = await response.json()
     await new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => reject(new Error('飞书拍照服务初始化超时，请检查网络后重试')), 12_000)
-      window.h5sdk!.config({ appId: signature.app_id, timestamp: signature.timestamp, nonceStr: signature.noncestr, signature: signature.signature, jsApiList: ['chooseImage', 'downloadFile', 'saveImageToPhotosAlbum'] })
+      window.h5sdk!.config({ appId: signature.app_id, timestamp: signature.timestamp, nonceStr: signature.noncestr, signature: signature.signature, jsApiList: ['chooseImage', 'downloadFile', 'saveImageToPhotosAlbum', 'closeWindow'] })
       window.h5sdk!.ready(() => { window.clearTimeout(timer); resolve() })
       window.h5sdk!.error?.((cause) => { window.clearTimeout(timer); reject(cause) })
     })
@@ -1150,6 +1152,23 @@ function taskSequence(task: ProductTask, index: number) {
   return task.sequence_no?.trim() || String(index + 1)
 }
 
+const exitConfirmationOpen = ref(false)
+let resolveExit: ((allowed: boolean) => void) | null = null
+function resolveExitConfirmation(allowed: boolean) {
+  exitConfirmationOpen.value = false
+  resolveExit?.(allowed)
+  resolveExit = null
+}
+async function leaveSystem() {
+  closeH5Camera()
+  const fallback = () => history.go(-2)
+  if (!window.tt?.closeWindow) { fallback(); return }
+  try {
+    await configureFeishuJsapi()
+    window.tt.closeWindow({ fail: fallback })
+  } catch { fallback() }
+}
+
 if (!isDesktopGalleryRoute) useNavigationHistory(
   () => page.value + (selectedGalleryPhoto.value ? ':photo' : ''),
   () => ({ page: page.value, photo: selectedGalleryPhoto.value }),
@@ -1161,6 +1180,10 @@ if (!isDesktopGalleryRoute) useNavigationHistory(
     selectedGalleryPhoto.value = snapshot.photo
     page.value = snapshot.page
     resetPhotoZoom()
+  },
+  {
+    confirm: () => new Promise<boolean>(resolve => { resolveExit = resolve; exitConfirmationOpen.value = true }),
+    leave: () => { void leaveSystem() },
   },
 )
 
@@ -1189,18 +1212,19 @@ onUnmounted(() => {
       <div v-if="isLoading" class="loading">正在加载任务…</div>
       <div v-else-if="error" class="loading">{{ error }}</div>
       <template v-else>
-        <section v-if="page === 'home'" class="screen home-screen">
+        <Transition :name="page === 'home' ? 'screen-back' : 'screen-forward'">
+        <section key="home" v-if="page === 'home'" class="screen home-screen">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>质检拍照</strong><span class="header-space"/></header>
           <div class="greeting"><div class="avatar">{{ surname }}</div><div><p class="eyebrow">{{ greeting }}</p><h1>{{ todayText }}</h1><p class="muted">每一张照片，都让交付更有凭据。</p></div></div>
           <div class="todo-card" :class="{ interactive: dashboard?.orders.length }" role="button" :aria-disabled="!dashboard?.orders.length" :tabindex="dashboard?.orders.length ? 0 : -1" @click="openFirstTask" @keydown.enter="openFirstTask" @keydown.space.prevent="openFirstTask"><div class="card-heading"><span>我的待办</span></div><div class="todo-row"><div class="todo-icon"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
           <div class="list-title"><div><p class="eyebrow">合同任务</p><h2>待处理订单</h2></div></div>
-          <div class="gallery-search order-search"><span aria-hidden="true">⌕</span><input v-model="orderSearch" type="search" placeholder="搜索合同编号、产品、规格…" maxlength="200"><button v-if="orderSearch" aria-label="清除搜索" @click="orderSearch = ''">×</button></div>
+          <div class="gallery-search order-search"><span aria-hidden="true">⌕</span><input v-model="orderSearch" type="text" inputmode="search" role="searchbox" placeholder="搜索合同编号、产品、规格…" maxlength="200"><button v-if="orderSearch" aria-label="清除搜索" @click="orderSearch = ''">×</button></div>
           <p v-if="!dashboard?.orders.length" class="empty">暂无分配给你的待处理任务</p>
           <p v-else-if="!visibleOrders.length" class="empty">没有符合搜索条件的订单</p>
           <article v-for="order in visibleOrders" :key="order.contract_no" class="contract-card" :class="{ completed: order.status === 'completed' }" @click="openTask(order.task_ids[0])"><div class="contract-top"><span class="status" :class="{ done: order.status === 'completed' }">{{ order.status === 'completed' ? '已完成' : '待拍摄' }}</span><span class="due">{{ formatDate(order.started_at) }}</span></div><h3>{{ order.contract_no }}</h3><div class="tag-row"><span v-for="product in order.products" :key="product">{{ product }}</span></div><div class="progress"><i :style="{ width: `${order.task_count ? (order.task_count - order.pending_count) / order.task_count * 100 : 0}%` }"/></div><footer><span>{{ order.status === 'completed' ? `已完成 ${order.task_count} / ${order.task_count} 项任务` : `剩余 ${order.pending_count} / ${order.task_count} 项任务` }}</span><b>{{ order.status === 'completed' ? '查看详情 ›' : '进入拍摄 ›' }}</b></footer></article>
         </section>
 
-        <section v-else-if="page === 'capture' && activeTask" class="screen capture-screen" :class="{ 'camera-visible': h5CameraOpen }">
+        <section key="capture" v-else-if="page === 'capture' && activeTask" class="screen capture-screen" :class="{ 'camera-visible': h5CameraOpen }">
           <header class="topbar capture-topbar"><button class="back" @click="taskPickerOpen = false; page = 'home'">‹</button><strong>拍照任务</strong><span/></header>
           <article class="order-card"><div><span class="eyebrow">合同编号</span><h2>{{ activeTask.contract_no }}</h2><p>共 {{ activeTask.tasks.length }} 个产品子任务</p></div><div class="order-badge"><b>{{ activeTask.tasks.length }}</b><small>产品子任务</small></div></article>
           <div class="capture-progress"><div><b>拍摄进度</b><span>{{ completedTaskCount }} / {{ activeTask.tasks.length }} 已提交</span></div><div class="progress"><i :style="{ width: `${captureProgress}%` }"/></div></div>
@@ -1256,10 +1280,10 @@ onUnmounted(() => {
           <div v-if="submitStatus !== 'idle'" class="upload-overlay"><div class="upload-dialog"><div v-if="submitStatus === 'uploading'" class="spinner"/><b>{{ submitStatus === 'uploading' ? '正在上传图片…' : submitStatus === 'success' ? (submitMode === 'save' ? '暂存成功' : '提交成功') : '上传失败' }}</b><p>{{ submitStatus === 'uploading' ? '请勿关闭当前页面' : submitStatus === 'success' ? (submitMode === 'save' ? '图片已上传，可在图片检索中查看；任务状态未变更' : '当前规格任务已完成') : submitError }}</p><button v-if="submitStatus === 'error'" @click="submitStatus = 'idle'">知道了</button></div></div>
         </section>
 
-        <section v-else class="screen gallery-screen" :class="{ 'selection-mode': gallerySelecting }">
+        <section key="gallery" v-else class="screen gallery-screen" :class="{ 'selection-mode': gallerySelecting }">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>图片检索</strong><span class="header-space"/></header>
           <div class="tabs gallery-tabs"><button :class="{ active: galleryScope === 'mine' }" @click="selectGalleryScope('mine')">我拍摄的</button><button :class="{ active: galleryScope === 'shared' }" @click="selectGalleryScope('shared')">与我共享</button></div>
-          <div class="gallery-search"><span aria-hidden="true">⌕</span><input v-model="gallerySearch" type="search" placeholder="搜索合同、产品、规格、部位…" maxlength="200" @input="scheduleGallerySearch" @keyup.enter="loadGallery()"><button v-if="gallerySearch" aria-label="清除搜索" @click="clearGallerySearch">×</button></div>
+          <div class="gallery-search"><span aria-hidden="true">⌕</span><input v-model="gallerySearch" type="text" inputmode="search" role="searchbox" placeholder="搜索合同、产品、规格、部位…" maxlength="200" @input="scheduleGallerySearch" @keyup.enter="loadGallery()"><button v-if="gallerySearch" aria-label="清除搜索" @click="clearGallerySearch">×</button></div>
           <div class="gallery-filter-shell">
             <div class="gallery-filters">
               <button class="filter-select" :class="{ selected: galleryProduct, open: galleryFilterOpen === 'product' }" @click="toggleGalleryFilter('product')"><span>产品</span>{{ galleryProduct || '全部产品' }} <i/></button>
@@ -1308,6 +1332,8 @@ onUnmounted(() => {
             <button :disabled="galleryPage === galleryTotalPages" @click="goToGalleryPage(galleryPage + 1)">下一页 ›</button>
           </nav>
         </section>
+        </Transition>
+        <Transition name="viewer-slide">
         <div v-if="selectedGalleryPhoto" class="photo-viewer" @click.self="closeGalleryPhoto">
           <header><button class="viewer-back" aria-label="关闭" @click="closeGalleryPhoto">‹</button><div><b>{{ selectedGalleryPhoto.contract_no }}</b><small>{{ selectedGalleryPhoto.product_type }} · {{ selectedGalleryPhoto.inspection_item }}<template v-if="selectedGalleryIndex >= 0"> · {{ selectedGalleryIndex + 1 }} / {{ galleryPhotos.length }}</template></small></div><button class="viewer-download" @click="openDownload([selectedGalleryPhoto.id])">下载</button></header>
           <p v-if="galleryDownloadError" class="viewer-error">{{ galleryDownloadError }}</p>
@@ -1320,6 +1346,7 @@ onUnmounted(() => {
             <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(1)"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 5 7 7-7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           </div>
         </div>
+        </Transition>
         <DownloadOptionsDialog
           v-if="downloadDialogOpen"
           v-model:with-watermark="downloadWithWatermark"
@@ -1334,6 +1361,7 @@ onUnmounted(() => {
           <p v-if="cameraError" class="h5-camera-error">{{ cameraError }}</p>
           <footer class="h5-camera-actions"><button class="h5-camera-alternative" :disabled="h5CameraPending > 0" @click="switchToFeishuCamera">飞书相机</button><button class="h5-camera-shutter" :disabled="!h5CameraReady || h5CameraPending >= 3" aria-label="拍照" @click="takeH5Photo"><span/></button><button class="h5-camera-done" :disabled="h5CameraPending > 0" @click="closeH5Camera">完成</button></footer>
         </div>
+        <ExitConfirmationDialog v-if="exitConfirmationOpen" @resolve="resolveExitConfirmation" />
         <div v-if="downloadToast" class="download-toast" role="status" aria-live="polite">{{ downloadToast }}</div>
         <nav class="nav"><button :class="{ active: page === 'home' }" @click="page = 'home'"><i>⌂</i><span>首页</span></button><button :class="{ active: page === 'capture' }" @click="openFirstTask"><i>◉</i><span>拍照任务</span></button><button :class="{ active: page === 'gallery' }" @click="openGallery"><i>▣</i><span>图片检索</span></button></nav>
       </template>
@@ -1431,5 +1459,26 @@ button:focus-visible,[role="button"]:focus-visible{outline:2px solid #8d9aaa;out
 .photo-viewer .viewer-download{width:80px;height:29px;padding:0 15px;border-radius:7px;font-size:12px;line-height:29px}
 .gallery-pagination{flex-wrap:wrap}
 @media(max-width:390px){.photo-viewer header{grid-template-columns:30px minmax(0,1fr) 74px;padding:8px 16px 8px 8px;gap:6px}.photo-viewer .viewer-download{width:74px;padding:0 12px}}
+
+
+/* Keep native form focus and search affordances consistent across devices. */
+select{accent-color:#3370ff;color-scheme:light}
+select:focus,select:focus-visible{outline:none;border-color:#3370ff;box-shadow:0 0 0 2px #3370ff20}
+input,textarea{accent-color:#3370ff}
+/* Overlap screens during navigation so returning never reveals a blank frame. */
+.phone > .screen{position:absolute;inset:0;background:#f5f7fa}
+.screen-forward-enter-active,.screen-back-enter-active,
+.screen-forward-leave-active,.screen-back-leave-active{transition:transform .32s cubic-bezier(.22,.68,0,1),opacity .32s ease;will-change:transform,opacity}
+.screen-forward-enter-from{transform:translateX(32px);opacity:0}
+.screen-forward-leave-to{transform:translateX(-16px);opacity:0}
+.screen-back-enter-from{transform:translateX(-24px);opacity:0}
+.screen-back-leave-to{transform:translateX(32px);opacity:0}
+.screen-forward-leave-active,.screen-back-leave-active{pointer-events:none}
+.viewer-slide-enter-active,.viewer-slide-leave-active{transition:transform .32s cubic-bezier(.22,.68,0,1),opacity .32s ease;will-change:transform,opacity}
+.viewer-slide-enter-from,.viewer-slide-leave-to{transform:translateX(40px);opacity:0}
+.viewer-slide-leave-active{pointer-events:none}
+@media(prefers-reduced-motion:reduce){
+.screen-forward-enter-active,.screen-back-enter-active,.screen-forward-leave-active,.screen-back-leave-active,.viewer-slide-enter-active,.viewer-slide-leave-active{transition:none}
+}
 
 </style>

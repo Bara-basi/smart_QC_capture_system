@@ -276,7 +276,7 @@ onUnmounted(() => {
       <div class="content">
         <section class="query-card" aria-label="图片筛选">
           <div class="search-row">
-            <label class="search"><span>⌕</span><input v-model="keyword" type="search" maxlength="200" placeholder="搜索合同编号、产品、规格或拍摄部位" @input="scheduleSearch" @keyup.enter="loadPhotos()"><button v-if="keyword" aria-label="清空搜索" @click="keyword = ''; loadPhotos()">×</button></label>
+            <label class="search"><span>⌕</span><input v-model="keyword" type="text" inputmode="search" role="searchbox" maxlength="200" placeholder="搜索合同编号、产品、规格或拍摄部位" @input="scheduleSearch" @keyup.enter="loadPhotos()"><button v-if="keyword" aria-label="清空搜索" @click="keyword = ''; loadPhotos()">×</button></label>
             <button class="search-submit" @click="loadPhotos()">搜索</button>
           </div>
           <div class="filters">
