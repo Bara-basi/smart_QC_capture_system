@@ -92,9 +92,18 @@ async def test_gallery_returns_one_fifty_photo_page_with_total_count(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_gallery_rejects_page_sizes_above_fifty() -> None:
-    with pytest.raises(ValueError, match="between 1 and 50"):
-        await dashboard_repository.inspector_photos("user-id", page_size=51)
+@pytest.mark.parametrize("page_size", [200, 500, 1000])
+async def test_gallery_accepts_expanded_page_sizes(monkeypatch: pytest.MonkeyPatch, page_size: int) -> None:
+    connection = FakeConnection()
+    monkeypatch.setattr(dashboard_repository.asyncpg, "connect", lambda _: _connection(connection))
+    await dashboard_repository.inspector_photos("user-id", page=2, page_size=page_size)
+    assert f"LIMIT {page_size} OFFSET {page_size}" in connection.queries[1]
+
+
+@pytest.mark.asyncio
+async def test_gallery_rejects_page_sizes_above_one_thousand() -> None:
+    with pytest.raises(ValueError, match="between 1 and 1000"):
+        await dashboard_repository.inspector_photos("user-id", page_size=1001)
 
 
 @pytest.mark.asyncio

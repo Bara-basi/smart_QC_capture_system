@@ -24,7 +24,7 @@ const hasUnavailableOriginals = computed(() => !withWatermark.value && (props.un
 
       <label class="watermark-choice">
         <input v-model="withWatermark" type="checkbox">
-        <span class="check-box" aria-hidden="true">✓</span>
+        <span class="check-box" aria-hidden="true"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
         <span>
           <b>下载图片携带水印</b>
           <small>勾选后下载带合同号、规格和拍摄时间的质检水印图片</small>
@@ -184,4 +184,14 @@ h2 + p {
   background: #b9c8e5;
   cursor: not-allowed;
 }
+
+/* Shared control geometry; pointer taps never paint a browser highlight. */
+.check-icon{display:block;width:18px;height:18px;flex:none}
+.page-size-control{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 8px;color:#87909c;font-size:12px}
+.page-size-control label{display:flex;align-items:center;gap:6px}
+.page-size-control select{max-width:110px;padding:6px 24px 6px 10px;border:1px solid #e2e7ee;border-radius:8px;background:#fff;color:#596575;font:inherit}
+
+.check-box{width:23px;height:23px;border:1.5px solid #c9d2de;border-radius:7px;display:grid;place-items:center;box-shadow:none}
+.watermark-choice input:focus-visible + .check-box{outline:2px solid #8d9aaa;outline-offset:3px}
+
 </style>

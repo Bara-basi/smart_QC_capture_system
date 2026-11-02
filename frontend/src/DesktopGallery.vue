@@ -26,7 +26,7 @@ const photos = ref<GalleryPhoto[]>([])
 const totalPhotos = ref(0)
 const currentPage = ref(1)
 const totalPages = ref(0)
-const pageSize = 50
+const pageSize = ref(200)
 const loading = ref(true)
 const error = ref('')
 const downloadBusy = ref(false)
@@ -71,7 +71,7 @@ async function loadPhotos(resetPage = true) {
       scope: scope.value,
       sort: sort.value,
       page: String(currentPage.value),
-      page_size: String(pageSize),
+      page_size: String(pageSize.value),
     })
     if (keyword.value.trim()) query.set('q', keyword.value.trim())
     if (product.value) query.set('product_type', product.value)
@@ -292,7 +292,7 @@ onUnmounted(() => {
         <section class="results" aria-live="polite">
           <header class="results-head">
             <div><b>{{ loading ? '正在加载…' : `共 ${totalPhotos} 张照片` }}</b><span v-if="!loading">第 {{ currentPage }} / {{ Math.max(totalPages, 1) }} 页 · 每页 {{ pageSize }} 张</span></div>
-            <div class="result-tools">
+            <div class="result-tools"><label class="page-size-control">每页 <select v-model.number="pageSize" @change="loadPhotos()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label>
               <button class="selection-button" :disabled="!photos.length" @click="toggleCurrentPage">{{ photos.length && photos.every(photo => selectedPhotoIds.has(photo.id)) ? '取消全选' : '全选本页' }}</button>
               <button class="download-selected" :disabled="!selectedPhotoIds.size" @click="openDownload([...selectedPhotoIds])">下载所选（{{ selectedPhotoIds.size }}）</button>
               <span class="divider"/>
@@ -306,10 +306,10 @@ onUnmounted(() => {
             <div v-for="photo in photos" :key="photo.id" class="photo-card" :class="{ 'is-selected': selectedPhotoIds.has(photo.id) }">
               <label class="photo-select" :class="{ checked: selectedPhotoIds.has(photo.id) }" @click.stop>
                 <input type="checkbox" :checked="selectedPhotoIds.has(photo.id)" :aria-label="`选择 ${photo.contract_no} 的照片`" @change="togglePhoto(photo.id)">
-                <span aria-hidden="true">✓</span>
+                <span aria-hidden="true"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
               </label>
               <button class="photo-open" @click="openPhoto(photo)">
-                <img :src="photoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`">
+                <img loading="lazy" decoding="async" :src="photoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`">
                 <div class="photo-meta"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ formatDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="scope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div>
               </button>
             </div>
@@ -327,7 +327,7 @@ onUnmounted(() => {
     <div v-if="selected" class="viewer" role="dialog" aria-modal="true" :aria-label="`${selected.contract_no} 照片预览`" @click.self="selected = null">
       <header><div><p>{{ selected.contract_no }} <template v-if="selectedIndex >= 0">· {{ selectedIndex + 1 }} / {{ photos.length }}</template></p><b>{{ selected.product_type }}<template v-if="selected.specification"> · {{ selected.specification }}</template> · {{ selected.inspection_item }}</b></div><div class="viewer-actions"><button class="download-button" @click="openDownload([selected.id])">⇩ 下载</button><button class="close-button" aria-label="关闭预览" @click="selected = null">×</button></div></header>
       <p v-if="downloadError" class="viewer-error">{{ downloadError }}</p>
-      <div class="viewer-stage" @dblclick.stop="handleViewerDoubleClick" @pointerdown="startSwipe" @pointerup="endSwipe" @pointercancel="cancelSwipe"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span><button class="viewer-nav previous" :disabled="!hasPrevious" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(-1)">‹</button><button class="viewer-nav next" :disabled="!hasNext" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(1)">›</button></div>
+      <div class="viewer-stage" @dblclick.stop="handleViewerDoubleClick" @pointerdown="startSwipe" @pointerup="endSwipe" @pointercancel="cancelSwipe"><img class="preview" :class="{ 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'preview')" alt="" :style="{ transform: rotationTransform }"><img class="full" :class="{ ready: fullLoaded, 'quarter-turn': rotation % 180 !== 0 }" :src="photoUrl(selected, 'full')" :alt="`${selected.contract_no} 高清照片`" :style="{ transform: rotationTransform }" @load="fullLoaded = true"><span v-if="!fullLoaded">正在加载高清图…</span><button class="viewer-nav previous" :disabled="!hasPrevious" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(-1)"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m15 5-7 7 7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button><button class="viewer-nav next" :disabled="!hasNext" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click="navigatePhoto(1)"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 5 7 7-7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>
       <footer><span>{{ formatDate(selected.captured_at) }}<template v-if="selected.inspection_note"> · 备注：{{ selected.inspection_note }}</template><template v-if="scope === 'shared' && selected.photographer_name"> · 拍摄人：{{ selected.photographer_name }}</template></span><span>← → / 滑动切换 · 双击旋转 · Esc 关闭</span></footer>
     </div>
     <DownloadOptionsDialog
@@ -379,4 +379,18 @@ onUnmounted(() => {
 .viewer-stage .viewer-nav.next{right:18px}
 .viewer-stage .viewer-nav:disabled{opacity:.2;pointer-events:none}
 @media(max-width:780px){.result-tools .selection-button,.result-tools .download-selected{padding:0 8px}.viewer header{padding:0 13px}.viewer header .viewer-actions{gap:5px!important}.viewer header .viewer-actions button{padding:0 8px}.viewer header b{max-width:40vw}}
+
+/* Shared control geometry; pointer taps never paint a browser highlight. */
+.check-icon{display:block;width:18px;height:18px;flex:none}
+.page-size-control{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 8px;color:#87909c;font-size:12px}
+.page-size-control label{display:flex;align-items:center;gap:6px}
+.page-size-control select{max-width:110px;padding:6px 24px 6px 10px;border:1px solid #e2e7ee;border-radius:8px;background:#fff;color:#596575;font:inherit}
+
+.photo-select{width:23px;height:23px;border:1.5px solid #c9d2de;border-radius:7px;box-shadow:0 1px 4px #18233810;display:grid;place-items:center}
+.photo-select span{display:grid;place-items:center}
+.viewer-stage .viewer-nav{top:44%;width:48px;height:54px;border:0;border-radius:0;background:transparent;backdrop-filter:none;box-shadow:none;filter:drop-shadow(0 1px 3px #0009)}
+.viewer-nav svg{width:32px;height:32px}
+.result-tools .page-size-control{margin:0 10px 0 0;justify-content:flex-start;gap:6px}
+.results-head,.result-tools{flex-wrap:wrap;gap:10px}
+
 </style>

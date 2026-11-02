@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { useNavigationHistory } from './navigationHistory'
 import DesktopGallery from './DesktopGallery.vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
@@ -64,7 +65,7 @@ const galleryPhotos = ref<GalleryPhoto[]>([])
 const galleryTotal = ref(0)
 const galleryPage = ref(1)
 const galleryTotalPages = ref(0)
-const galleryPageSize = 50
+const galleryPageSize = ref(200)
 const selectedGalleryPhotoIds = ref<Set<string>>(new Set())
 const downloadDialogOpen = ref(false)
 const downloadWithWatermark = ref(true)
@@ -223,7 +224,7 @@ async function loadGallery(resetPage = true) {
       sort: gallerySort.value,
       scope: galleryScope.value,
       page: String(galleryPage.value),
-      page_size: String(galleryPageSize),
+      page_size: String(galleryPageSize.value),
     })
     if (galleryProduct.value) query.set('product_type', galleryProduct.value)
     if (galleryPart.value) query.set('inspection_category', galleryPart.value)
@@ -1149,6 +1150,20 @@ function taskSequence(task: ProductTask, index: number) {
   return task.sequence_no?.trim() || String(index + 1)
 }
 
+if (!isDesktopGalleryRoute) useNavigationHistory(
+  () => page.value + (selectedGalleryPhoto.value ? ':photo' : ''),
+  () => ({ page: page.value, photo: selectedGalleryPhoto.value }),
+  snapshot => {
+    closeH5Camera()
+    taskPickerOpen.value = false
+    downloadDialogOpen.value = false
+    fullPhotoLoaded.value = false
+    selectedGalleryPhoto.value = snapshot.photo
+    page.value = snapshot.page
+    resetPhotoZoom()
+  },
+)
+
 onMounted(async () => {
   if (isDesktopGalleryRoute) return
   document.addEventListener('visibilitychange', handleCameraVisibilityChange)
@@ -1177,7 +1192,7 @@ onUnmounted(() => {
         <section v-if="page === 'home'" class="screen home-screen">
           <header class="topbar centered-title"><span class="brand-mark">QC</span><strong>质检拍照</strong><span class="header-space"/></header>
           <div class="greeting"><div class="avatar">{{ surname }}</div><div><p class="eyebrow">{{ greeting }}</p><h1>{{ todayText }}</h1><p class="muted">每一张照片，都让交付更有凭据。</p></div></div>
-          <div class="todo-card" :class="{ interactive: dashboard?.orders.length }" role="button" :aria-disabled="!dashboard?.orders.length" :tabindex="dashboard?.orders.length ? 0 : -1" @click="openFirstTask" @keydown.enter="openFirstTask" @keydown.space.prevent="openFirstTask"><div class="card-heading"><span>我的待办</span></div><div class="todo-row"><div class="todo-icon">✓</div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
+          <div class="todo-card" :class="{ interactive: dashboard?.orders.length }" role="button" :aria-disabled="!dashboard?.orders.length" :tabindex="dashboard?.orders.length ? 0 : -1" @click="openFirstTask" @keydown.enter="openFirstTask" @keydown.space.prevent="openFirstTask"><div class="card-heading"><span>我的待办</span></div><div class="todo-row"><div class="todo-icon"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><b>{{ dashboard?.pending_task_count || 0 }}</b><small>待处理</small></div><div class="todo-sep"/><div><b>{{ dashboard?.orders.filter(order => order.status === 'completed').length || 0 }}</b><small>已完成订单</small></div><span class="go">›</span></div></div>
           <div class="list-title"><div><p class="eyebrow">合同任务</p><h2>待处理订单</h2></div></div>
           <div class="gallery-search order-search"><span aria-hidden="true">⌕</span><input v-model="orderSearch" type="search" placeholder="搜索合同编号、产品、规格…" maxlength="200"><button v-if="orderSearch" aria-label="清除搜索" @click="orderSearch = ''">×</button></div>
           <p v-if="!dashboard?.orders.length" class="empty">暂无分配给你的待处理任务</p>
@@ -1223,7 +1238,7 @@ onUnmounted(() => {
               <div class="group-head"><span class="component-icon">◈</span><b>{{ task.specification || '未填写规格' }} · {{ task.product_type }}</b><button v-if="uploadedTaskIds.has(task.feishu_record_id) && !editingTaskIds.has(task.feishu_record_id)" class="edit-task" @click="editTask(task.feishu_record_id)">编辑照片</button><small>{{ openSubtask + 1 }} / {{ activeTask.tasks.length }}</small></div>
               <div class="group-content">
                 <div v-for="requirement in task.requirements" :key="requirement.name" class="shot-item">
-                  <div class="shot-heading"><div class="check" :class="{ checked: (photos[photoKey(task.feishu_record_id, requirement.name)] || []).length }">{{ (photos[photoKey(task.feishu_record_id, requirement.name)] || []).length ? '✓' : '' }}</div><div><b>{{ requirement.name }} <em v-if="requirement.mandatory">*</em></b><p>请确保画面清晰、可识别，并覆盖对应质检需求。</p></div></div>
+                  <div class="shot-heading"><div class="check" :class="{ checked: (photos[photoKey(task.feishu_record_id, requirement.name)] || []).length }"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><div><b>{{ requirement.name }} <em v-if="requirement.mandatory">*</em></b><p>请确保画面清晰、可识别，并覆盖对应质检需求。</p></div></div>
                   <div class="photo-row"><div v-for="(photo, photoIndex) in photos[photoKey(task.feishu_record_id, requirement.name)] || []" :key="photo.name + photoIndex" class="photo" :class="photo.tone"><img :src="photo.url" :alt="photo.name"><button v-if="!uploadedTaskIds.has(task.feishu_record_id) || editingTaskIds.has(task.feishu_record_id)" class="remove-photo" aria-label="删除照片" @click="removePhoto(task.feishu_record_id, requirement.name, photoIndex)">×</button><span>{{ photo.name }}</span></div><button v-if="!uploadedTaskIds.has(task.feishu_record_id) || editingTaskIds.has(task.feishu_record_id)" class="add-photo" @click="addPhoto(task.feishu_record_id, requirement.name)"><i>+</i><span>拍照</span></button></div>
                   <label v-if="requirement.name === SUPPLEMENTAL_REQUIREMENT" class="supplemental-note"><span>补充说明（选填）</span><textarea :value="supplementalNotes[task.feishu_record_id] || ''" maxlength="500" placeholder="填写客户的特殊要求、拍摄内容或其他说明" :disabled="uploadedTaskIds.has(task.feishu_record_id) && !editingTaskIds.has(task.feishu_record_id)" @input="updateSupplementalNote(task.feishu_record_id, ($event.target as HTMLTextAreaElement).value)"/></label>
                 </div>
@@ -1281,11 +1296,12 @@ onUnmounted(() => {
             <div v-for="photo in galleryPhotos" :key="photo.id" class="gallery-item" :class="{ 'is-selected': selectedGalleryPhotoIds.has(photo.id) }">
               <label class="gallery-select" :class="{ checked: selectedGalleryPhotoIds.has(photo.id) }" @click.stop>
                 <input type="checkbox" :checked="selectedGalleryPhotoIds.has(photo.id)" :aria-label="`选择 ${photo.contract_no} 的照片`" @change="toggleGalleryPhoto(photo.id)">
-                <span aria-hidden="true">✓</span>
+                <span aria-hidden="true"><svg class="check-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m5 12 4.5 4.5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
               </label>
-              <button class="gallery-open" @click="openGalleryPhoto(photo)"><img class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button>
+              <button class="gallery-open" @click="openGalleryPhoto(photo)"><img loading="lazy" decoding="async" class="thumb" :src="galleryPhotoUrl(photo, 'preview')" :alt="`${photo.contract_no} ${photo.inspection_item}`"><div class="file-info"><b>{{ photo.contract_no }}</b><span>{{ photo.product_type }}<template v-if="photo.specification"> · {{ photo.specification }}</template></span><small>{{ photo.inspection_item }} · {{ galleryDate(photo.captured_at) }}</small><small v-if="photo.inspection_note">备注：{{ photo.inspection_note }}</small><small v-if="galleryScope === 'shared' && photo.photographer_name">拍摄人：{{ photo.photographer_name }}</small></div><i class="item-arrow">›</i></button>
             </div>
           </div>
+          <div class="page-size-control"><span>共 {{ galleryTotal }} 张</span><label>每页 <select v-model.number="galleryPageSize" @change="loadGallery()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label></div>
           <nav v-if="galleryTotalPages > 1 && !galleryLoading" class="gallery-pagination" aria-label="照片分页">
             <button :disabled="galleryPage === 1" @click="goToGalleryPage(galleryPage - 1)">‹ 上一页</button>
             <button v-for="page in galleryPageNumbers" :key="page" :class="{ active: page === galleryPage }" :aria-current="page === galleryPage ? 'page' : undefined" @click="goToGalleryPage(page)">{{ page }}</button>
@@ -1300,8 +1316,8 @@ onUnmounted(() => {
             <span v-if="!fullPhotoLoaded" class="hd-loading">正在加载高清图…</span>
             <span v-else-if="photoScale === 1" class="gesture-hint">左右滑动切换 · 双指捏合缩放 · 双击旋转</span>
             <span v-else class="zoom-level">{{ Math.round(photoScale * 100) }}%</span>
-            <button class="photo-nav previous" :disabled="!hasPreviousGalleryPhoto" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(-1)">‹</button>
-            <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(1)">›</button>
+            <button class="photo-nav previous" :disabled="!hasPreviousGalleryPhoto" aria-label="上一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(-1)"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m15 5-7 7 7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+            <button class="photo-nav next" :disabled="!hasNextGalleryPhoto" aria-label="下一张照片" @pointerdown.stop @dblclick.stop.prevent @click.stop="navigateGalleryPhoto(1)"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m9 5 7 7-7 7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
           </div>
         </div>
         <DownloadOptionsDialog
@@ -1373,7 +1389,7 @@ onUnmounted(() => {
 .gallery-select input{position:absolute;width:1px;height:1px;opacity:0}
 .gallery-select span{font-size:15px;font-weight:800;line-height:1}
 .gallery-select.checked{border-color:#3370ff;background:#3370ff;color:#fff}
-.gallery-select:focus-within{outline:3px solid #3370ff2b;outline-offset:2px}
+.gallery-select:has(input:focus-visible){outline:2px solid #8d9aaa;outline-offset:3px}
 .gallery.grid .gallery-item{display:block;padding:6px}
 .gallery.grid .gallery-open{display:block}
 .gallery.grid .gallery-select{top:11px;left:11px}
@@ -1393,4 +1409,27 @@ onUnmounted(() => {
 .download-toast{position:absolute;z-index:55;left:50%;bottom:82px;transform:translateX(-50%);max-width:calc(100% - 44px);padding:9px 14px;border-radius:16px;background:#303844e8;color:#fff;box-shadow:0 7px 22px #17233c33;font-size:12px;line-height:18px;text-align:center;pointer-events:none;animation:toast-in .18s ease-out}
 @keyframes toast-in{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}
 @media(max-width:390px){.photo-viewer header{grid-template-columns:34px minmax(0,1fr) auto;padding:8px 7px}.photo-viewer .viewer-download{padding:0 7px}.gallery-pagination{gap:4px}.gallery-pagination button{padding:0 6px}}
+
+/* Shared control geometry; pointer taps never paint a browser highlight. */
+.check-icon{display:block;width:18px;height:18px;flex:none}
+.page-size-control{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:16px 0 8px;color:#87909c;font-size:12px}
+.page-size-control label{display:flex;align-items:center;gap:6px}
+.page-size-control select{max-width:110px;padding:6px 24px 6px 10px;border:1px solid #e2e7ee;border-radius:8px;background:#fff;color:#596575;font:inherit}
+
+:where(button,a,label,input,select,[role="button"]){-webkit-tap-highlight-color:transparent}
+button:focus:not(:focus-visible),[role="button"]:focus:not(:focus-visible){outline:none}
+button:focus-visible,[role="button"]:focus-visible{outline:2px solid #8d9aaa;outline-offset:3px}
+.gallery-select,.photo-select,.check{width:22px;height:22px;border:1.5px solid #c9d2de;border-radius:7px;background:#fff;box-shadow:none;display:grid;place-items:center;flex:none}
+.gallery-select span{display:grid;place-items:center}
+.gallery-select.checked,.check.checked{border-color:#3370ff;background:#3370ff;color:#fff;box-shadow:0 2px 5px #3370ff1a}
+.check:not(.checked) .check-icon{visibility:hidden}
+.todo-icon .check-icon{width:24px;height:24px}
+.photo-stage .photo-nav{top:44%;width:42px;height:48px;background:transparent;border:0;border-radius:0;backdrop-filter:none;box-shadow:none;color:#f5f7fb;filter:drop-shadow(0 1px 3px #0009)}
+.photo-nav svg{width:28px;height:28px}
+.photo-stage .photo-nav.previous{left:6px}.photo-stage .photo-nav.next{right:6px}
+.photo-viewer header{grid-template-columns:36px minmax(0,1fr) 80px;padding:8px 20px 8px 10px;gap:10px}
+.photo-viewer .viewer-download{width:80px;height:29px;padding:0 15px;border-radius:7px;font-size:12px;line-height:29px}
+.gallery-pagination{flex-wrap:wrap}
+@media(max-width:390px){.photo-viewer header{grid-template-columns:30px minmax(0,1fr) 74px;padding:8px 16px 8px 8px;gap:6px}.photo-viewer .viewer-download{width:74px;padding:0 12px}}
+
 </style>

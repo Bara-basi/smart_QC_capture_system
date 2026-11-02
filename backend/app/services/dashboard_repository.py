@@ -529,7 +529,7 @@ async def inspector_photos(
     scope: str = "mine",
     search: str | None = None,
     page: int = 1,
-    page_size: int = 50,
+    page_size: int = 200,
 ) -> tuple[list[dict[str, Any]], int]:
     """Return one page of visible photos and the total matching row count."""
     category_prefixes = {
@@ -548,8 +548,8 @@ async def inspector_photos(
         raise ValueError("Invalid photo scope")
     if page < 1:
         raise ValueError("Invalid photo page")
-    if page_size < 1 or page_size > 50:
-        raise ValueError("Photo page size must be between 1 and 50")
+    if page_size < 1 or page_size > 1000:
+        raise ValueError("Photo page size must be between 1 and 1000")
 
     captured_from_date = _filter_date(captured_from, "captured_from")
     captured_to_date = _filter_date(captured_to, "captured_to")

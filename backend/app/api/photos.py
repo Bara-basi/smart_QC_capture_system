@@ -42,7 +42,7 @@ async def list_photos(
     scope: str = Query(default="mine", pattern="^(mine|shared)$"),
     q: str | None = Query(default=None, max_length=200),
     page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=50, ge=1, le=50),
+    page_size: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, object]:
     user_id = request.session.get("user_id")
     if not user_id:
