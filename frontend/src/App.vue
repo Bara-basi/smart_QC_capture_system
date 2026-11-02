@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { useNavigationHistory } from './navigationHistory'
 import ExitConfirmationDialog from './ExitConfirmationDialog.vue'
 import DesktopGallery from './DesktopGallery.vue'
+import SmoothSelect from './SmoothSelect.vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { cleanExpiredDrafts, draftsForContract, removeDraft, removeDrafts, saveDraft, type PhotoDraft } from './drafts'
 import { rangeIdsInclusive } from './selection'
@@ -1309,7 +1310,7 @@ onUnmounted(() => {
             <div class="gallery-count"><b>共 {{ galleryTotal }} 张照片</b><small>第 {{ galleryPage }} / {{ Math.max(galleryTotalPages, 1) }} 页 · 每页 {{ galleryPageSize }} 张</small></div>
             <div class="gallery-actions"><button class="sort-button" :title="gallerySort === 'desc' ? '当前：最近拍摄在前' : '当前：最早拍摄在前'" @click="gallerySort = gallerySort === 'desc' ? 'asc' : 'desc'; loadGallery()">{{ gallerySort === 'desc' ? '↓' : '↑' }} 时间</button><button :class="{ active: galleryView === 'grid' }" title="卡片显示" @click="galleryView = 'grid'">▦</button><button :class="{ active: galleryView === 'list' }" title="记录显示" @click="galleryView = 'list'">☷</button></div>
           </div>
-          <div class="page-size-control"><span>分页显示</span><label>每页 <select v-model.number="galleryPageSize" @change="loadGallery()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label></div>
+          <div class="page-size-control"><span>分页显示</span><label>每页 <SmoothSelect v-model="galleryPageSize" label="每页照片数量" :options="[200, 500, 1000].map(size => ({ value: size, label: size + ' 张' }))" @change="loadGallery()" /></label></div>
           <div v-if="galleryPhotos.length && !galleryLoading" class="gallery-batch-bar">
             <button @click="toggleGalleryPageSelection">{{ galleryPhotos.every(photo => selectedGalleryPhotoIds.has(photo.id)) ? '取消全选' : '全选本页' }}</button>
             <span>已选 {{ selectedGalleryPhotoIds.size }} 张</span>
@@ -1481,4 +1482,6 @@ input,textarea{accent-color:#3370ff}
 .screen-forward-enter-active,.screen-back-enter-active,.screen-forward-leave-active,.screen-back-leave-active,.viewer-slide-enter-active,.viewer-slide-leave-active{transition:none}
 }
 
+
+.filter-select{border-radius:10px}.filter-panel,.task-sequence-menu{border-radius:16px;border-color:#e5eaf2;box-shadow:0 12px 32px #22375612}.option-panel button,.task-sequence-option{border-radius:10px}
 </style>

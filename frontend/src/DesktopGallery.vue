@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
+import SmoothSelect from './SmoothSelect.vue'
 import DownloadOptionsDialog from './DownloadOptionsDialog.vue'
 import { rangeIdsInclusive } from './selection'
 
@@ -280,8 +281,8 @@ onUnmounted(() => {
             <button class="search-submit" @click="loadPhotos()">搜索</button>
           </div>
           <div class="filters">
-            <label>产品<select v-model="product" @change="loadPhotos()"><option value="">全部产品</option><option v-for="item in productOptions" :key="item" :value="item">{{ item }}</option></select></label>
-            <label>拍摄部位<select v-model="part" @change="loadPhotos()"><option value="">全部部位</option><option v-for="item in partOptions" :key="item.value" :value="item.value">{{ item.label }}</option></select></label>
+            <label>产品<SmoothSelect v-model="product" label="产品" :options="[{ value: '', label: '全部产品' }, ...productOptions.map(item => ({ value: item, label: item }))]" @change="loadPhotos()" /></label>
+            <label>拍摄部位<SmoothSelect v-model="part" label="拍摄部位" :options="[{ value: '', label: '全部部位' }, ...partOptions]" @change="loadPhotos()" /></label>
             <label>开始日期<input v-model="from" type="date" :max="to || undefined" @change="loadPhotos()"></label>
             <label>结束日期<input v-model="to" type="date" :min="from || undefined" @change="loadPhotos()"></label>
             <button v-if="activeFilterCount" class="clear-filters" @click="resetFilters">清除筛选（{{ activeFilterCount }}）</button>
@@ -292,7 +293,7 @@ onUnmounted(() => {
         <section class="results" aria-live="polite">
           <header class="results-head">
             <div><b>{{ loading ? '正在加载…' : `共 ${totalPhotos} 张照片` }}</b><span v-if="!loading">第 {{ currentPage }} / {{ Math.max(totalPages, 1) }} 页 · 每页 {{ pageSize }} 张</span></div>
-            <div class="result-tools"><label class="page-size-control">每页 <select v-model.number="pageSize" @change="loadPhotos()"><option v-for="size in [200, 500, 1000]" :key="size" :value="size">{{ size }} 张</option></select></label>
+            <div class="result-tools"><label class="page-size-control">每页 <SmoothSelect v-model="pageSize" label="每页照片数量" :options="[200, 500, 1000].map(size => ({ value: size, label: size + ' 张' }))" @change="loadPhotos()" /></label>
               <button class="selection-button" :disabled="!photos.length" @click="toggleCurrentPage">{{ photos.length && photos.every(photo => selectedPhotoIds.has(photo.id)) ? '取消全选' : '全选本页' }}</button>
               <button class="download-selected" :disabled="!selectedPhotoIds.size" @click="openDownload([...selectedPhotoIds])">下载所选（{{ selectedPhotoIds.size }}）</button>
               <span class="divider"/>
@@ -393,4 +394,7 @@ onUnmounted(() => {
 .result-tools .page-size-control{margin:0 10px 0 0;justify-content:flex-start;gap:6px}
 .results-head,.result-tools{flex-wrap:wrap;gap:10px}
 
+
+.filters .smooth-select{min-width:158px}.filters input{border-radius:10px}
+@media(max-width:780px){.filters .smooth-select{width:100%;min-width:0}}
 </style>
