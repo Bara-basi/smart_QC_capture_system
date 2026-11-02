@@ -66,7 +66,7 @@ onUnmounted(() => {
 <template>
   <span class="smooth-select">
     <button ref="trigger" type="button" class="select-trigger" :class="{ open }" :aria-label="`${label}：${selectedLabel}`" aria-haspopup="listbox" :aria-expanded="open" :aria-controls="open ? id : undefined" @click="show" @keydown.down.prevent="show" @keydown.up.prevent="show">
-      <span>{{ selectedLabel }}</span><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span><slot name="selected">{{ selectedLabel }}</slot></span><svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
     </button>
     <Teleport to="body">
       <Transition name="select-panel">
@@ -83,9 +83,9 @@ onUnmounted(() => {
 <style scoped>
 .smooth-select{display:inline-flex;min-width:0;color:#596575;font-size:12px}
 .smooth-select .select-trigger{display:flex;align-items:center;justify-content:space-between;gap:16px;width:100%;min-width:100px;height:34px;padding:0 11px;border:1px solid #e1e7ef;border-radius:10px;background:#fff;color:#596575;font:inherit;cursor:pointer;transition:border-color .16s,box-shadow .16s}
-.select-trigger span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.select-trigger svg{width:14px;height:14px;flex:none;color:#8795a6;transition:transform .18s}
+.select-trigger>span{min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}.select-trigger svg{width:14px;height:14px;flex:none;color:#8795a6;transition:transform .18s}
 .smooth-select .select-trigger:hover{border-color:#b9ccef}.smooth-select .select-trigger.open,.smooth-select .select-trigger:focus-visible{border-color:#8bb1ff;outline:none;box-shadow:0 0 0 3px #3370ff12}.select-trigger.open svg{transform:rotate(180deg)}
-.smooth-options{position:fixed;z-index:160;overflow-y:auto;overscroll-behavior:contain;padding:6px;border:1px solid #e5eaf2;border-radius:14px;background:#fff;color:#445063;box-shadow:0 12px 36px #2237561c,0 3px 8px #2237560a;font:13px/1.4 Inter,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}
+.smooth-options{position:fixed;z-index:160;overflow-y:auto;overscroll-behavior:contain;touch-action:pan-y;-webkit-overflow-scrolling:touch;padding:6px;border:1px solid #e5eaf2;border-radius:14px;background:#fff;color:#445063;box-shadow:0 12px 36px #2237561c,0 3px 8px #2237560a;font:13px/1.4 Inter,"PingFang SC","Microsoft YaHei",sans-serif;outline:none}
 .smooth-option{display:flex;align-items:center;justify-content:space-between;gap:14px;min-height:36px;padding:7px 10px;border-radius:9px;cursor:pointer}.smooth-option.active{background:#f3f6fb}.smooth-option.selected{background:#edf3ff;color:#2863db;font-weight:600}.smooth-option svg{width:17px;height:17px;flex:none}
 .select-panel-enter-active,.select-panel-leave-active{transition:opacity .14s,transform .14s}.select-panel-enter-from,.select-panel-leave-to{opacity:0;transform:translateY(-4px)}
 @media(prefers-reduced-motion:reduce){.select-panel-enter-active,.select-panel-leave-active{transition:none}}
