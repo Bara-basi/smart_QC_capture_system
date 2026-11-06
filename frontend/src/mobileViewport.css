@@ -1,0 +1,28 @@
+/* Keep the app shell inside the layout viewport, including older WebViews. */
+.stage {
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+}
+.stage > .phone {
+  min-width: 0;
+  max-width: 100%;
+}
+
+/* iOS zooms the visual viewport when small editable fields receive focus.
+   Use readable field text instead of disabling the user's pinch zoom. */
+@media (max-width: 600px), (hover: none) and (pointer: coarse) {
+  .stage .gallery-search input,
+  .stage .supplemental-note textarea,
+  .desktop-gallery .search input,
+  .desktop-gallery .filters input {
+    font-size: 16px;
+  }
+}
+
+@media (max-width: 600px) {
+  .stage > .phone {
+    height: 100vh;
+    height: 100dvh;
+  }
+}
